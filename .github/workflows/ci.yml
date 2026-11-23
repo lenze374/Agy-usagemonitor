@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Smoke-test release packaging
+        run: python scripts/manage.py package --out dist-ci
+
+  js-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate embedded dashboard JS syntax
+        run: |
+          python -c "
+          import re, subprocess, sys
+          sys.path.insert(0, 'src')
+          import dashboard_ui
+          m = re.search(r'<script>(.*)</script>', dashboard_ui.DASHBOARD_HTML, re.S)
+          assert m, 'missing script block'
+          subprocess.run(['node', '--check', '-'], input=m.group(1), text=True, check=True)
+          "

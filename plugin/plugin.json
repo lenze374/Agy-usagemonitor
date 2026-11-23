@@ -1,0 +1,12 @@
+{
+  "name": "usage-monitor",
+  "displayName": "Antigravity Usage Monitor",
+  "version": "0.1.0",
+  "description": "Local Antigravity shared-pool quota reconciliation, 1-minute denoised watermark monitor, quiet-window model rate calibration, and bilingual Extensions sidecar dashboard.",
+  "logo": "logo.svg",
+  "suggestedPrompts": [
+    "Run agy-usage to inspect today's and this week's quota attribution and calibrated model rates",
+    "Run agy-usage --monitor-changes to inspect recent shared-pool watermark changes",
+    "Run agy-usage --backfill to enrich historical ledger turns with per-step token and model metadata"
+  ]
+}
