@@ -39,6 +39,7 @@ ACTIVE_DIR = os.path.join(DATA_DIR, "active")
 LEDGER_PATH = os.path.join(DATA_DIR, "ledger.jsonl")
 MONITOR_LOG = os.path.join(DATA_DIR, "monitor.jsonl")
 SIDECAR_STATE_PATH = os.path.join(DATA_DIR, "sidecar_runtime.json")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
 AGY_DATA_ROOT = os.path.expanduser(
     os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "~/.gemini/antigravity"

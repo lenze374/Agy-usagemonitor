@@ -878,6 +878,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div id="opsToast" class="toast"></div>
 
     <div class="sec-head">
+      <span class="sec-title" id="secPresetTitle">冷启动模型单价预设</span>
+    </div>
+    <div class="card">
+      <select id="presetSelect" style="width:100%;margin-bottom:6px;">
+        <option value="none" id="optPresetNone">关闭 — 仅按本机实测自动校准</option>
+        <option value="ultra_5x" id="optPresetUltra5x">Google AI Ultra 5x (carbon 1.0% · neon 0.5% · hydrogen 0.25%)</option>
+        <option value="ultra_20x" id="optPresetUltra20x">Google AI Ultra 20x (carbon 0.25% · neon 0.125% · hydrogen 0.0625%)</option>
+      </select>
+      <div id="presetNote" style="font-size:11px;color:var(--um-muted);line-height:1.45;">
+        仅适用于 Ultra 5x / 20x 用户冷启动；Pro 与免费用户请保持关闭。有本地实测样本时自动覆盖；gemini-4-argon 暂不预置，会在首轮实测后自动校准。
+      </div>
+    </div>
+
+    <div class="sec-head">
       <span class="sec-title" id="secDiagTitle">运行诊断</span>
     </div>
     <div id="diagCard" class="card"></div>
@@ -989,6 +1003,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         secModels: '我最常用哪些模型',
         pendingCal: '待采集',
         estSibling: '* 参考同系',
+        estPreset: '* 预设初值',
         modelSub: (t, s, hit) => `${t} 次对话 / ${s} 步 · 缓存命中 ${hit}%`,
         ratePer1M: r => `每1M耗额 ${r}`,
         noModels: '暂无模型用量记录',
@@ -1008,6 +1023,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         btnBackfill: '补录缺失 Token',
         btnCopySummary: '复制文本摘要',
         btnDownloadSummary: '下载 .txt 摘要',
+        secPreset: '冷启动模型单价预设',
+        presetNone: '关闭 — 仅按本机实测自动校准（推荐 Pro / 免费用户）',
+        presetUltra5x: 'Google AI Ultra 5x（carbon 1.0% · neon 0.5% · hydrogen 0.25%）',
+        presetUltra20x: 'Google AI Ultra 20x（carbon 0.25% · neon 0.125% · hydrogen 0.0625%）',
+        presetNote: '仅适用于 Ultra 5x / 20x 用户冷启动估算；Pro 与免费用户请保持关闭。积累到本机干净实测样本后会自动覆盖预设；gemini-4-argon 暂不预置，会在首轮实测后自动校准。',
+        presetSaved: p => `已切换单价预设: ${p}`,
         secDiag: '运行诊断',
         running: '执行中...',
         done: '已完成',
@@ -1017,6 +1038,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         downloadedSummary: f => `已下载 ${f}`,
         diagVer: '插件版本',
         diagBill: '计费模式',
+        diagPreset: '冷启动预设',
+        diagPresetVal: p => p === 'ultra_5x' ? 'Ultra 5x' : (p === 'ultra_20x' ? 'Ultra 20x' : '关闭 (纯自校准)'),
         diagRatioGem: 'Gemini 5h:周 比例',
         diagRatioCg: 'C/G 5h:周 比例',
         diagCal: (r, n, ok) => ok ? `${r}:1 (已校准 n=${n})` : `${r}:1 (默认兜底 n=${n})`,
@@ -1121,6 +1144,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         secModels: 'Calibrated Model Usage',
         pendingCal: 'pending',
         estSibling: '* family fallback',
+        estPreset: '* preset prior',
         modelSub: (t, s, hit) => `${t} turns / ${s} steps · Cache hit ${hit}%`,
         ratePer1M: r => `${r} / 1M EqIn`,
         noModels: 'No model usage recorded yet',
@@ -1140,6 +1164,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         btnBackfill: 'Backfill Tokens',
         btnCopySummary: 'Copy Text Summary',
         btnDownloadSummary: 'Download .txt Summary',
+        secPreset: 'Cold-Start Model Rate Preset',
+        presetNone: 'Off — Self-calibrate from local data only (Pro / Free)',
+        presetUltra5x: 'Google AI Ultra 5x (carbon 1.0% · neon 0.5% · hydrogen 0.25%)',
+        presetUltra20x: 'Google AI Ultra 20x (carbon 0.25% · neon 0.125% · hydrogen 0.0625%)',
+        presetNote: 'Applies to Google AI Ultra 5x / 20x cold start only; keep Off for Pro & Free tiers. Local clean samples always override presets automatically. gemini-4-argon stays un-seeded until observed locally.',
+        presetSaved: p => `Rate preset updated: ${p}`,
         secDiag: 'Diagnostics',
         running: 'Running...',
         done: 'Done',
@@ -1149,6 +1179,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         downloadedSummary: f => `Downloaded ${f}`,
         diagVer: 'Plugin Version',
         diagBill: 'Billing Mode',
+        diagPreset: 'Rate Preset',
+        diagPresetVal: p => p === 'ultra_5x' ? 'Ultra 5x' : (p === 'ultra_20x' ? 'Ultra 20x' : 'Off (self-calibrated)'),
         diagRatioGem: 'Gemini 5h:Weekly Ratio',
         diagRatioCg: 'C/G 5h:Weekly Ratio',
         diagCal: (r, n, ok) => ok ? `${r}:1 (calibrated n=${n})` : `${r}:1 (default n=${n})`,
@@ -1236,6 +1268,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('btnBackfill').textContent = t.btnBackfill;
       document.getElementById('btnCopySummary').textContent = t.btnCopySummary;
       document.getElementById('btnDownloadSummary').textContent = t.btnDownloadSummary;
+      document.getElementById('secPresetTitle').textContent = t.secPreset;
+      document.getElementById('optPresetNone').textContent = t.presetNone;
+      document.getElementById('optPresetUltra5x').textContent = t.presetUltra5x;
+      document.getElementById('optPresetUltra20x').textContent = t.presetUltra20x;
+      document.getElementById('presetNote').textContent = t.presetNote;
       document.getElementById('secDiagTitle').textContent = t.secDiag;
     }
 
@@ -2032,8 +2069,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const t = T();
       const models = d.models || [];
       document.getElementById('modelBars').innerHTML = models.length ? models.map(m => {
+        const estTag = m.rateKind === 'preset' ? t.estPreset : (m.estimated ? t.estSibling : '');
         const rateTxt = m.rateWeekly !== null
-          ? `${fmtSpend(m.rateWeekly, 4)}${m.estimated ? t.estSibling : ''}`
+          ? `${fmtSpend(m.rateWeekly, 4)}${estTag}`
           : t.pendingCal;
         const estTxt = m.estGw !== null ? `${fmtSpend(m.estGw, 4)}${m.estimated ? '*' : ''}` : '-';
         const wPct = Math.max(0, Math.min(100, Number(m.sharePct || 0)));
@@ -2079,12 +2117,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function renderSettingsDiag(d) {
       const t = T();
       const diag = d.diagnostics || {};
+      const activePreset = diag.ratePreset || d.ratePreset || 'none';
+      const presetSel = document.getElementById('presetSelect');
+      if (presetSel) presetSel.value = activePreset;
       const gR = diag.geminiRatio || { ratio: 4.0, samples: 0, calibrated: false };
       const cR = diag.cgRatio || { ratio: 4.0, samples: 0, calibrated: false };
       const poolsTxt = (diag.poolKeys && diag.poolKeys.length) ? diag.poolKeys.join(', ') : '-';
       const rows = [
-        [t.diagVer, `v${diag.version || '0.1.0'}`],
+        [t.diagVer, `v${diag.version || '0.1.1'}`],
         [t.diagBill, `${diag.billingMode || '-'}${diag.plan ? ' (' + diag.plan + ')' : ''}`],
+        [t.diagPreset, t.diagPresetVal(activePreset)],
         [t.diagRatioGem, t.diagCal(Number(gR.ratio || 4).toFixed(2), gR.samples || 0, gR.calibrated)],
         [t.diagRatioCg, t.diagCal(Number(cR.ratio || 4).toFixed(2), cR.samples || 0, cR.calibrated)],
         [t.diagPools, poolsTxt],
@@ -2260,6 +2302,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     document.getElementById('btnBackfill').addEventListener('click', () => triggerAction('backfill'));
     document.getElementById('btnCopySummary').addEventListener('click', () => exportSummary(false));
     document.getElementById('btnDownloadSummary').addEventListener('click', () => exportSummary(true));
+    document.getElementById('presetSelect').addEventListener('change', async e => {
+      const t = T();
+      const val = e.target.value || 'none';
+      await triggerAction('set_preset', { preset: val });
+      const toast = document.getElementById('opsToast');
+      if (toast && !toast.textContent.startsWith('Action failed') && !toast.textContent.startsWith('操作失败')) {
+        toast.textContent = t.presetSaved(val);
+      }
+    });
 
     if (typeof ResizeObserver !== 'undefined') {
       const ro = new ResizeObserver(() => {

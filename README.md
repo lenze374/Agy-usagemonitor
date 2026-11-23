@@ -68,7 +68,23 @@ Or double-click `install.bat`.
 3. **My Usage**:
    - Calibrated per-model burn rates (`%/1M EqIn`), cache hit rates, and recent 25 conversation groups (collapsing subagent bursts cleanly).
 4. **Settings & Diagnostics**:
-   - Toggle conversation Hook `ON/OFF`, backfill missing historical tokens/per-step models, copy or download an in-memory `.txt` summary (zero automatic disk report exports), switch `Auto / 简体中文 / English`, and inspect runtime diagnostics.
+   - Toggle conversation Hook `ON/OFF`, backfill missing historical tokens/per-step models, choose an optional cold-start rate preset (`Off` / `Ultra 5x` / `Ultra 20x`), copy or download an in-memory `.txt` summary (zero automatic disk report exports), switch `Auto / 简体中文 / English`, and inspect runtime diagnostics.
+
+---
+
+## Cold-Start Model Rate Presets (Ultra 5x / 20x Only)
+
+By default (`none` / Off), UsageMonitor learns every model's burn rate purely from your own clean local turns (`calibrate_weekly_model_rates`). Before you accumulate clean samples for a model family, you can optionally enable a cold-start prior from **Settings & Diag** or via `agy-usage --preset {none,ultra_5x,ultra_20x}`:
+
+| Model Family | Ultra 5x (Weekly % / 1M EqIn) | Ultra 20x (Weekly % / 1M EqIn) | Notes |
+| :--- | :--- | :--- | :--- |
+| `gemini-4-carbon-*` / `gemini-pro-orchestrator` | `1.0000%` | `0.2500%` | Verified on Ultra 5x (`In:Cache:Out = 1:0.05:5`) |
+| `gemini-4-neon-*` | `0.5000%` | `0.1250%` | Verified on Ultra 5x |
+| `gemini-4-hydrogen-*` / `gemini-flash-worker-agy` | `0.2500%` | `0.0625%` | Verified on Ultra 5x |
+| `gemini-4-argon-*` | Un-seeded (`pending`) | Un-seeded (`pending`) | Excluded intentionally; auto-calibrates on first local clean turn |
+
+- **Pro & Free tiers**: Keep the preset **Off (`none`)** — Google AI Pro and Free accounts use different pool capacities and bucket structures, so Ultra presets do not apply.
+- **Automatic override**: As soon as your local ledger collects clean samples for a model (or same-family sibling), locally measured rates automatically override the preset prior.
 
 ---
 

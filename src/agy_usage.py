@@ -22,6 +22,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from common import (
+    atomic_write_text,
     disp_width,
     fetch_quota_best,
     pad_l,
@@ -31,6 +32,7 @@ from common import (
 )
 from paths import (
     BRAIN_DIR,
+    CONFIG_PATH,
     HOOKS_JSON_PATH,
     HOOK_KEY,
     LEDGER_PATH,
@@ -45,6 +47,19 @@ W_CACHE = 0.05
 W_OUTPUT = 5.0
 DEFAULT_FIVE_H_RATIO = 4.0
 FIVE_H_TO_WEEKLY = 1.0 / DEFAULT_FIVE_H_RATIO
+
+VALID_RATE_PRESETS = ("none", "ultra_5x", "ultra_20x")
+# Empirical cold-start Weekly % per 1M Equivalent Input rates for Google AI Ultra 5x.
+# NOTE: Ultra presets do NOT apply to Google AI Pro or Free tiers (different pool capacities
+# and separate Argon buckets). `gemini-4-argon-*` is intentionally omitted here because no
+# verified Ultra empirical samples exist yet; it auto-calibrates on the first clean turn.
+ULTRA_5X_FAMILY_PRIORS = (
+    (("gemini-4-carbon", "gemini-pro-orchestrator"), 1.0),
+    (("gemini-4-neon",), 0.5),
+    (("gemini-4-hydrogen", "gemini-flash-worker-agy"), 0.25),
+)
+# Ultra 20x pool capacity is 4x Ultra 5x -> Weekly % per 1M Equivalent Input is divided by 4.
+PRESET_SCALE = {"ultra_5x": 1.0, "ultra_20x": 0.25}
 
 
 def fmt_tok(n):
@@ -144,8 +159,63 @@ def eq_input_1m(tokens_dict):
     return (W_INPUT * in_t + W_CACHE * cr_t + W_OUTPUT * out_t) / 1_000_000.0
 
 
-def resolve_model_rate(model_name, weekly_rates):
-    """Resolve Weekly % per 1M Equivalent Input rate for `model_name` with family fallback."""
+def load_user_config(config_path=None):
+    """Read-only JSON loader for user preferences (`config.json`); fail-open with defaults."""
+    path = config_path or CONFIG_PATH
+    cfg = {"ratePreset": "none"}
+    if not path or not os.path.isfile(path):
+        return cfg
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            cfg.update(raw)
+    except Exception:
+        return {"ratePreset": "none"}
+    if cfg.get("ratePreset") not in VALID_RATE_PRESETS:
+        cfg["ratePreset"] = "none"
+    return cfg
+
+
+def get_rate_preset(config_path=None):
+    """Return active cold-start rate preset (`none`, `ultra_5x`, or `ultra_20x`)."""
+    return load_user_config(config_path=config_path).get("ratePreset", "none")
+
+
+def set_rate_preset(preset, config_path=None):
+    """Persist validated cold-start rate preset atomically to `config.json`."""
+    p = str(preset or "none").strip()
+    if p not in VALID_RATE_PRESETS:
+        raise ValueError(f"Invalid rate preset: {preset!r} (expected one of {VALID_RATE_PRESETS})")
+    path = config_path or CONFIG_PATH
+    cfg = load_user_config(config_path=path)
+    cfg["ratePreset"] = p
+    atomic_write_text(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    return p
+
+
+def lookup_preset_model_rate(model_name, rate_preset="none"):
+    """Return cold-start Weekly % per 1M Equivalent Input for `model_name` under `rate_preset`, or None."""
+    scale = PRESET_SCALE.get(str(rate_preset or "none"))
+    if scale is None:
+        return None
+    ml = str(model_name or "").strip().lower()
+    if not ml:
+        return None
+    for prefixes, base_rate in ULTRA_5X_FAMILY_PRIORS:
+        for pref in prefixes:
+            if ml == pref or ml.startswith(pref + "-"):
+                return round(base_rate * scale, 6)
+    return None
+
+
+def resolve_model_rate(model_name, weekly_rates, rate_preset="none"):
+    """
+    Resolve Weekly % per 1M Equivalent Input rate for `model_name`:
+      1. Exact locally calibrated model rate
+      2. Same-family locally calibrated sibling fallback
+      3. Optional cold-start preset (Ultra 5x / Ultra 20x only)
+    """
     m = str(model_name or "auto").strip()
     if m in weekly_rates:
         return weekly_rates[m], False, m
@@ -161,17 +231,21 @@ def resolve_model_rate(model_name, weekly_rates):
             if k.startswith(fam_prefix):
                 return weekly_rates[k], True, k
 
+    prior = lookup_preset_model_rate(m, rate_preset=rate_preset)
+    if prior is not None:
+        return prior, True, f"preset:{rate_preset}"
+
     return None, False, ""
 
 
-def row_theoretical_weekly_info(r, weekly_rates):
+def row_theoretical_weekly_info(r, weekly_rates, rate_preset="none"):
     """Return `(theoretical_weekly_pct, is_estimated, source_model)` for a ledger turn."""
     by_m = split_turn_steps_by_model(r)
     if by_m:
         total_val = 0.0
         any_est = False
         for m_i, tok_m in by_m.items():
-            w_rate, is_est, _ = resolve_model_rate(m_i, weekly_rates)
+            w_rate, is_est, _ = resolve_model_rate(m_i, weekly_rates, rate_preset=rate_preset)
             if w_rate is None:
                 return None, False, ""
             total_val += eq_input_1m(tok_m) * w_rate
@@ -185,14 +259,14 @@ def row_theoretical_weekly_info(r, weekly_rates):
         return total_val, any_est, src
 
     m = str(r.get("model") or "auto")
-    w_rate, is_est, src_m = resolve_model_rate(m, weekly_rates)
+    w_rate, is_est, src_m = resolve_model_rate(m, weekly_rates, rate_preset=rate_preset)
     if w_rate is None:
         return None, False, ""
     return eq_input_1m(r.get("tokens") or {}) * w_rate, is_est, src_m
 
 
-def row_theoretical_weekly(r, weekly_rates):
-    val, _, _ = row_theoretical_weekly_info(r, weekly_rates)
+def row_theoretical_weekly(r, weekly_rates, rate_preset="none"):
+    val, _, _ = row_theoretical_weekly_info(r, weekly_rates, rate_preset=rate_preset)
     return val
 
 
@@ -1134,7 +1208,7 @@ def turn_measured_weekly_delta(r, five_h_to_weekly=FIVE_H_TO_WEEKLY):
 
 
 def _compute_pool_active_and_span(
-    valid_items, pool_key, weekly_rates, model_filter=None, five_h_to_weekly=FIVE_H_TO_WEEKLY
+    valid_items, pool_key, weekly_rates, model_filter=None, five_h_to_weekly=FIVE_H_TO_WEEKLY, rate_preset="none"
 ):
     """Compute `(active_delta, span_delta)` for a weekly pool (`gemini_weekly` or `claude_gpt_weekly`)."""
     win_bounds = {}
@@ -1190,7 +1264,7 @@ def _compute_pool_active_and_span(
         s5_clean, e5_clean, ep5_set = [], [], set()
 
         for r in c_rows:
-            r_est = row_theoretical_weekly(r, weekly_rates)
+            r_est = row_theoretical_weekly(r, weekly_rates, rate_preset=rate_preset)
             if r_est is not None:
                 c_est += r_est
 
@@ -1261,7 +1335,7 @@ def _compute_pool_active_and_span(
     return active_val, span_val
 
 
-def summarize_period(rows, since_dt, weekly_rates, until_dt=None, five_h_to_weekly=FIVE_H_TO_WEEKLY):
+def summarize_period(rows, since_dt, weekly_rates, until_dt=None, five_h_to_weekly=FIVE_H_TO_WEEKLY, rate_preset="none"):
     turns = 0
     steps = 0
     cg_turns = 0
@@ -1304,7 +1378,7 @@ def summarize_period(rows, since_dt, weekly_rates, until_dt=None, five_h_to_week
         cr_tok += int(tok.get("cacheRead") or 0)
         out_tok += int(tok.get("output") or 0)
 
-        r_est, is_est_fb, _ = row_theoretical_weekly_info(r, weekly_rates)
+        r_est, is_est_fb, _ = row_theoretical_weekly_info(r, weekly_rates, rate_preset=rate_preset)
         if r_est is not None:
             if is_est_fb:
                 has_fallback_est = True
@@ -1323,6 +1397,7 @@ def summarize_period(rows, since_dt, weekly_rates, until_dt=None, five_h_to_week
         weekly_rates,
         model_filter=lambda r: not is_third_party_model(r.get("model")),
         five_h_to_weekly=five_h_to_weekly,
+        rate_preset=rate_preset,
     )
     active_cw, span_cw = _compute_pool_active_and_span(
         valid_items,
@@ -1330,6 +1405,7 @@ def summarize_period(rows, since_dt, weekly_rates, until_dt=None, five_h_to_week
         weekly_rates,
         model_filter=lambda r: is_third_party_model(r.get("model")),
         five_h_to_weekly=five_h_to_weekly,
+        rate_preset=rate_preset,
     )
 
     return {
@@ -1352,7 +1428,7 @@ def summarize_period(rows, since_dt, weekly_rates, until_dt=None, five_h_to_week
     }
 
 
-def print_model_table(rows, weekly_rates, model_samples):
+def print_model_table(rows, weekly_rates, model_samples, rate_preset="none"):
     by_model = {}
     for r in rows:
         if r.get("status") == "long_gap":
@@ -1417,9 +1493,11 @@ def print_model_table(rows, weekly_rates, model_samples):
         tot_prompt = g["in"] + g["cr"]
         hit_pct = (100.0 * g["cr"] / tot_prompt) if tot_prompt > 0 else 0.0
         cache_str = f"{fmt_tok(g['cr'])} ({hit_pct:4.1f}%)" if tot_prompt > 0 else "-"
-        w_rate, is_est_fb, _src_m = resolve_model_rate(m, weekly_rates)
+        w_rate, is_est_fb, _src_m = resolve_model_rate(m, weekly_rates, rate_preset=rate_preset)
         n_clean = len(model_samples.get(m, []))
-        if w_rate is not None and is_est_fb:
+        if w_rate is not None and str(_src_m).startswith("preset:"):
+            rate_str = f"{w_rate:6.4f}%* (预设)"
+        elif w_rate is not None and is_est_fb:
             rate_str = f"{w_rate:6.4f}%* (估)"
         elif w_rate is not None:
             rate_str = f"{w_rate:6.4f}% (n={n_clean})"
@@ -1491,7 +1569,7 @@ def build_recent_display_items(rows, expand_subagents):
     return items
 
 
-def compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_weekly=FIVE_H_TO_WEEKLY):
+def compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_weekly=FIVE_H_TO_WEEKLY, rate_preset="none"):
     """Compute display metrics (model label, tokens, theoretical %, measured %, status) for a group."""
     grp_rows = item["rows"]
     m_full = item["model"]
@@ -1513,7 +1591,7 @@ def compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_week
     est_val = None
     est_estimated = False
     if len(grp_rows) == 1:
-        single_est, is_est_fb, _ = row_theoretical_weekly_info(grp_rows[0][1], weekly_rates)
+        single_est, is_est_fb, _ = row_theoretical_weekly_info(grp_rows[0][1], weekly_rates, rate_preset=rate_preset)
         if billed > 0 and single_est is not None:
             est_val = single_est
             est_estimated = is_est_fb
@@ -1521,7 +1599,7 @@ def compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_week
         else:
             est_str = "-"
     else:
-        w_rate, is_est_fb, _ = resolve_model_rate(m_full, weekly_rates)
+        w_rate, is_est_fb, _ = resolve_model_rate(m_full, weekly_rates, rate_preset=rate_preset)
         eq_m = (W_INPUT * in_t + W_CACHE * cr_t + W_OUTPUT * out_t) / 1_000_000.0
         if billed > 0 and w_rate is not None:
             est_val = eq_m * w_rate
@@ -1618,7 +1696,7 @@ def compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_week
     }
 
 
-def print_recent_table(rows, overlapping, weekly_rates, recent_n, expand_subagents, five_h_to_weekly=FIVE_H_TO_WEEKLY):
+def print_recent_table(rows, overlapping, weekly_rates, recent_n, expand_subagents, five_h_to_weekly=FIVE_H_TO_WEEKLY, rate_preset="none"):
     display_items = build_recent_display_items(rows, expand_subagents)
     shown = display_items[-recent_n:] if recent_n > 0 else []
     if not shown:
@@ -1637,7 +1715,7 @@ def print_recent_table(rows, overlapping, weekly_rates, recent_n, expand_subagen
     for item in shown:
         end_str = (item["endIso"] or "")[:19].replace("T", " ")
         ws = item["workspace"][:10]
-        met = compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_weekly=five_h_to_weekly)
+        met = compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_weekly=five_h_to_weekly, rate_preset=rate_preset)
         print(
             f"{pad_r(end_str, 19)} | {pad_r(ws, 10)} | {pad_r(met['m_disp'], 18)} | "
             f"{pad_l(met['steps'], 4)} | {pad_l(met['tok_str'], 22)} | "
@@ -1709,6 +1787,7 @@ def reconcile_shared_pools(
     live_snap=None,
     mon_summary=None,
     five_h_to_weekly=None,
+    rate_preset="none",
 ):
     """Compute closed-loop shared-pool reconciliation (`localEst` vs `external/groupmates`)."""
     import agy_monitor
@@ -1733,6 +1812,7 @@ def reconcile_shared_pools(
         weekly_rates,
         until_dt=until_dt,
         five_h_to_weekly=five_h_to_weekly,
+        rate_preset=rate_preset,
     )
     has_mon = len(mon_summary.get("clean_rows") or []) > 0
     live_pools = (live_snap or {}).get("pools") or {}
@@ -1826,6 +1906,7 @@ def build_arg_parser():
         "  agy-usage --monitor-changes   Show only monitor ticks with quota changes\n"
         "  agy-usage --monitor-watch     Follow monitor.jsonl live in terminal\n"
         "  agy-usage --on / --off        Toggle conversation hook tracking\n"
+        "  agy-usage --preset ultra_5x   Set cold-start model rate preset (Ultra 5x/20x only)\n"
         "  agy-usage --backfill          Backfill missing tokens/step models from transcripts\n"
     )
     parser = argparse.ArgumentParser(
@@ -1850,6 +1931,12 @@ def build_arg_parser():
     g_maint = parser.add_argument_group("Hook & Ledger Maintenance")
     g_maint.add_argument("--on", action="store_true", help="Enable conversation hook tracking")
     g_maint.add_argument("--off", action="store_true", help="Pause conversation hook tracking")
+    g_maint.add_argument(
+        "--preset",
+        choices=VALID_RATE_PRESETS,
+        default=None,
+        help="Set cold-start model rate preset (Ultra 5x/20x only; not for Pro/Free)",
+    )
     g_maint.add_argument("--status", action="store_true", help="Show hook status and storage paths")
     g_maint.add_argument("--backfill", action="store_true", help="Backfill missing tokens from local transcripts")
     return parser
@@ -1876,9 +1963,15 @@ def main():
     if args.off:
         set_hook_enabled(False)
         return
+    if args.preset is not None:
+        chosen = set_rate_preset(args.preset)
+        print(f"冷启动模型单价预设已更新: {chosen} ({CONFIG_PATH})")
+        return
     if args.status:
         print(f"插件 Hook 当前状态: {'已启用 (ON)' if get_hook_enabled() else '已暂停 (OFF)'}")
+        print(f"冷启动单价预设    : {get_rate_preset()}")
         print(f"Hook 配置文件位置 : {HOOKS_JSON_PATH}")
+        print(f"偏好配置文件位置  : {CONFIG_PATH}")
         print(f"账本文件位置      : {LEDGER_PATH}")
         return
     if args.backfill:
@@ -1889,6 +1982,7 @@ def main():
         print_live_quota()
 
     hook_on = get_hook_enabled()
+    rate_preset = get_rate_preset()
     print(f"=== Antigravity 用量与 Token 账本 (默认口径: 周额度% | Hook: {'ON' if hook_on else 'OFF'}) ===")
 
     rows = load_entries()
@@ -1935,7 +2029,7 @@ def main():
     total_false_resets = 0
     has_fb_any = False
     for label, dt_start in periods:
-        s = summarize_period(rows, dt_start, weekly_rates, five_h_to_weekly=five_h_to_w)
+        s = summarize_period(rows, dt_start, weekly_rates, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset)
         if label == "当前周 (Current Wk)":
             total_long_gaps = s["long_gap_count"]
             total_false_resets = s["false_reset_count"]
@@ -1958,6 +2052,8 @@ def main():
         )
 
     notes = []
+    if rate_preset != "none":
+        notes.append(f"冷启动单价预设: {rate_preset}（有本地实测时自动覆盖）")
     if gem_cal:
         notes.append(f"Gemini 5h:周 动态比例 {gem_ratio:.2f}:1 (n={gem_n})")
     if total_false_resets > 0:
@@ -1965,30 +2061,30 @@ def main():
     if total_long_gaps > 0:
         notes.append(f"{total_long_gaps} 条跨休眠记录已自动剔除")
     if has_fb_any:
-        notes.append("标 * 为同系列单价兜底估算（待洁净样本校准）")
+        notes.append("标 * 为同系列兜底或冷启动预设估算（待洁净样本校准）")
     if notes:
         print("* 注：" + "；".join(notes) + "。")
 
     if monitor_rows:
         rec_gem = reconcile_shared_pools(
-            rows, monitor_rows, weekly_rates, quota_wk_start, five_h_to_weekly=five_h_to_w
+            rows, monitor_rows, weekly_rates, quota_wk_start, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
         )
         rec_cg = (
             rec_gem
             if cg_wk_start == quota_wk_start
             else reconcile_shared_pools(
-                rows, monitor_rows, weekly_rates, cg_wk_start, five_h_to_weekly=five_h_to_w
+                rows, monitor_rows, weekly_rates, cg_wk_start, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
             )
         )
         print_shared_pool_reconciliation(rec_gem, rec_cg)
 
-    print_model_table(rows, weekly_rates, model_samples)
+    print_model_table(rows, weekly_rates, model_samples, rate_preset=rate_preset)
 
     if args.models and args.recent == 12 and "--recent" not in sys.argv and "-n" not in sys.argv:
         pass
     elif args.recent > 0:
         print_recent_table(
-            rows, overlapping, weekly_rates, args.recent, args.expand_subagents, five_h_to_weekly=five_h_to_w
+            rows, overlapping, weekly_rates, args.recent, args.expand_subagents, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
         )
 
     if args.steps > 0:

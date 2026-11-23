@@ -27,9 +27,9 @@ def _read_version():
     manifest = os.path.join(PLUGIN_ASSETS_DIR, "plugin.json")
     try:
         with open(manifest, "r", encoding="utf-8") as f:
-            return str(json.load(f).get("version") or "0.1.0")
+            return str(json.load(f).get("version") or "0.1.1")
     except Exception:
-        return "0.1.0"
+        return "0.1.1"
 
 
 def default_plugin_dir():

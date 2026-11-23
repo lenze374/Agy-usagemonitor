@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Comprehensive cross-platform unit tests for Antigravity Usage Monitor (v0.1.0)."""
+"""Comprehensive cross-platform unit tests for Antigravity Usage Monitor (v0.1.1)."""
 
 import hashlib
 import importlib
@@ -639,14 +639,14 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertEqual(len(chgs), 1)
         self.assertAlmostEqual(chgs[0]["dgw"], 0.10, places=4)
         self.assertIn("diagnostics", payload)
-        self.assertEqual(payload["diagnostics"]["version"], "0.1.0")
+        self.assertEqual(payload["diagnostics"]["version"], "0.1.1")
 
         # Verify in-memory summary generation writes zero files
         before_files = set(os.listdir(self.data_dir))
         for lang in ("zh-CN", "en"):
             res = self.dashboard_data.perform_action("export_summary", {"lang": lang})
             self.assertTrue(res["ok"])
-            self.assertIn("0.1.0", res["content"])
+            self.assertIn("0.1.1", res["content"])
         self.assertEqual(set(os.listdir(self.data_dir)), before_files)
 
         # Verify bilingual UI markers & zero host CSS regressions
@@ -707,9 +707,9 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(pkg["sha256Path"]))
         with zipfile.ZipFile(pkg["zipPath"], "r") as zf:
             names = set(zf.namelist())
-            self.assertIn("agy-usagemonitor-0.1.0/src/sidecar_daemon.py", names)
-            self.assertIn("agy-usagemonitor-0.1.0/scripts/manage.py", names)
-            self.assertIn("agy-usagemonitor-0.1.0/plugin/plugin.json", names)
+            self.assertIn("agy-usagemonitor-0.1.1/src/sidecar_daemon.py", names)
+            self.assertIn("agy-usagemonitor-0.1.1/scripts/manage.py", names)
+            self.assertIn("agy-usagemonitor-0.1.1/plugin/plugin.json", names)
 
         h = hashlib.sha256()
         with open(pkg["zipPath"], "rb") as f:
@@ -724,6 +724,81 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertFalse(un["removedData"])
         self.assertFalse(os.path.exists(p_dir))
         self.assertTrue(os.path.isfile(self.paths.LEDGER_PATH))
+
+    def test_cold_start_rate_presets_and_local_override(self):
+        # 1. Default preset is 'none' (no hardcoded rates injected, read-only)
+        self.assertEqual(self.agy_usage.get_rate_preset(), "none")
+        self.assertFalse(os.path.exists(self.paths.CONFIG_PATH))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-carbon-medium", {}, "none"), (None, False, ""))
+
+        # 2. Ultra 5x priors: carbon/neon/hydrogen only; argon & 3p remain None
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-carbon-medium", {}, "ultra_5x"), (1.0, True, "preset:ultra_5x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-pro-orchestrator", {}, "ultra_5x"), (1.0, True, "preset:ultra_5x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-neon-high", {}, "ultra_5x"), (0.5, True, "preset:ultra_5x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-hydrogen-high", {}, "ultra_5x"), (0.25, True, "preset:ultra_5x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-flash-worker-agy", {}, "ultra_5x"), (0.25, True, "preset:ultra_5x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-argon-high", {}, "ultra_5x"), (None, False, ""))
+        self.assertEqual(self.agy_usage.resolve_model_rate("claude-4-sonnet", {}, "ultra_5x"), (None, False, ""))
+
+        # 3. Ultra 20x scales weekly % per 1M EqIn by 0.25 (4x pool capacity)
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-carbon-medium", {}, "ultra_20x"), (0.25, True, "preset:ultra_20x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-neon-medium", {}, "ultra_20x"), (0.125, True, "preset:ultra_20x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-hydrogen-xhigh", {}, "ultra_20x"), (0.0625, True, "preset:ultra_20x"))
+        self.assertEqual(self.agy_usage.resolve_model_rate("gemini-4-argon-medium", {}, "ultra_20x"), (None, False, ""))
+
+        # 4. Local exact & same-family calibrated rates always override preset priors
+        local_rates = {"gemini-4-hydrogen-high": 0.30, "gemini-4-neon-high": 0.55}
+        self.assertEqual(
+            self.agy_usage.resolve_model_rate("gemini-4-hydrogen-high", local_rates, "ultra_5x"),
+            (0.30, False, "gemini-4-hydrogen-high"),
+        )
+        self.assertEqual(
+            self.agy_usage.resolve_model_rate("gemini-4-neon-xhigh", local_rates, "ultra_5x"),
+            (0.55, True, "gemini-4-neon-high"),
+        )
+        self.assertEqual(
+            self.agy_usage.resolve_model_rate("gemini-4-carbon-medium", local_rates, "ultra_5x"),
+            (1.0, True, "preset:ultra_5x"),
+        )
+
+        # 5. Dashboard action persists preset & reflects in payload + HTML
+        bad_res = self.dashboard_data.perform_action("set_preset", {"preset": "pro_tier"})
+        self.assertFalse(bad_res["ok"])
+
+        self._seed_sample_logs()
+        with open(self.paths.LEDGER_PATH, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "ts": time.time() - 600.0,
+                        "startTs": time.time() - 620.0,
+                        "startIso": datetime.fromtimestamp(time.time() - 620.0).astimezone().isoformat(timespec="seconds"),
+                        "endIso": datetime.fromtimestamp(time.time() - 600.0).astimezone().isoformat(timespec="seconds"),
+                        "model": "gemini-4-carbon-medium",
+                        "status": "ok",
+                        "invocations": 1,
+                        "tokens": {"input": 100000, "cacheRead": 0, "output": 0, "billedSteps": 1},
+                        "pools": {},
+                    }
+                )
+                + "\n"
+            )
+
+        ok_res = self.dashboard_data.perform_action("set_preset", {"preset": "ultra_20x"})
+        self.assertTrue(ok_res["ok"])
+        self.assertEqual(self.agy_usage.get_rate_preset(), "ultra_20x")
+
+        payload = self.dashboard_data.build_dashboard_payload(window="24h", recent_n=10, live=False)
+        self.assertEqual(payload["ratePreset"], "ultra_20x")
+        self.assertEqual(payload["diagnostics"]["ratePreset"], "ultra_20x")
+        carbon_row = next(m for m in payload["models"] if m["model"] == "gemini-4-carbon-medium")
+        self.assertEqual(carbon_row["rateKind"], "preset")
+        self.assertAlmostEqual(carbon_row["rateWeekly"], 0.25, places=4)
+        self.assertAlmostEqual(carbon_row["estGw"], 0.025, places=4)
+
+        html = self.dashboard_ui.DASHBOARD_HTML
+        self.assertIn("presetSelect", html)
+        self.assertIn("set_preset", html)
 
 
 if __name__ == "__main__":

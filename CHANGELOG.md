@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1 (2026-11-23)
+
+### Added
+- **Optional Cold-Start Model Rate Presets (`none` / `ultra_5x` / `ultra_20x`)**:
+  - Defaults to `none` (pure local self-calibration — recommended for Google AI Pro and Free tiers, which have different pool capacities and bucket structures).
+  - Pre-seeds verified Ultra 5x priors (`carbon`: `1.0000%`, `neon`: `0.5000%`, `hydrogen`: `0.2500%` Weekly % per 1M Equivalent Input at `In:Cache:Out = 1:0.05:5`) and `÷ 4` scaled Ultra 20x priors (`0.2500%`, `0.1250%`, `0.0625%`) when selected.
+  - Leaves `gemini-4-argon-*` intentionally un-seeded so it self-calibrates cleanly from the user's first clean turn.
+  - Locally calibrated rates (and same-family calibrated siblings) always override preset priors automatically.
+  - Configurable via Extensions Sidecar UI (**Settings & Diag**) and CLI (`agy-usage --preset {none,ultra_5x,ultra_20x}`), persisted in `<DATA_DIR>/config.json`.
+
 ## v0.1.0 (2026-11-23)
 
 Initial public cross-platform release of **Antigravity Usage Monitor** (`usage-monitor`).

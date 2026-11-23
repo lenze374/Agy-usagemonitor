@@ -37,7 +37,7 @@ def _fmt_reset_short(iso_str):
     return dt.strftime("%m-%d %H:%M") if dt else "-"
 
 
-def _build_model_rows(rows, weekly_rates, model_samples):
+def _build_model_rows(rows, weekly_rates, model_samples, rate_preset="none"):
     by_model = {}
     for r in rows:
         if r.get("status") == "long_gap":
@@ -73,7 +73,7 @@ def _build_model_rows(rows, weekly_rates, model_samples):
         g = by_model[m]
         tot_prompt = g["in"] + g["cr"]
         hit_pct = round(100.0 * g["cr"] / tot_prompt, 1) if tot_prompt > 0 else 0.0
-        w_rate, is_est_fb, src_m = agy_usage.resolve_model_rate(m, weekly_rates)
+        w_rate, is_est_fb, src_m = agy_usage.resolve_model_rate(m, weekly_rates, rate_preset=rate_preset)
         n_clean = len(model_samples.get(m, []))
         eq_m = (
             agy_usage.W_INPUT * g["in"]
@@ -83,6 +83,14 @@ def _build_model_rows(rows, weekly_rates, model_samples):
         est_gw = round(eq_m * w_rate, 4) if (w_rate is not None and (tot_prompt + g["out"]) > 0) else None
         if est_gw is not None:
             tot_est_all += est_gw
+        if w_rate is None:
+            rate_kind = "pending"
+        elif str(src_m).startswith("preset:"):
+            rate_kind = "preset"
+        elif is_est_fb:
+            rate_kind = "sibling"
+        else:
+            rate_kind = "calibrated"
         out.append(
             {
                 "model": m,
@@ -94,6 +102,7 @@ def _build_model_rows(rows, weekly_rates, model_samples):
                 "hitPct": hit_pct,
                 "rateWeekly": round(w_rate, 4) if w_rate is not None else None,
                 "estimated": is_est_fb,
+                "rateKind": rate_kind,
                 "rateSource": src_m,
                 "samples": n_clean,
                 "estGw": est_gw,
@@ -106,13 +115,15 @@ def _build_model_rows(rows, weekly_rates, model_samples):
     return out
 
 
-def _build_recent_rows(rows, overlapping, weekly_rates, recent_n=25, five_h_to_weekly=agy_usage.FIVE_H_TO_WEEKLY):
+def _build_recent_rows(
+    rows, overlapping, weekly_rates, recent_n=25, five_h_to_weekly=agy_usage.FIVE_H_TO_WEEKLY, rate_preset="none"
+):
     items = agy_usage.build_recent_display_items(rows, expand_subagents=False)
     shown = items[-recent_n:] if recent_n > 0 else []
     result = []
     for item in reversed(shown):
         met = agy_usage.compute_display_item_metrics(
-            item, overlapping, weekly_rates, five_h_to_weekly=five_h_to_weekly
+            item, overlapping, weekly_rates, five_h_to_weekly=five_h_to_weekly, rate_preset=rate_preset
         )
         result.append(
             {
@@ -193,7 +204,9 @@ def _downsample_clean_series(clean_rows, max_points=320):
     return pts
 
 
-def _build_attribution_buckets(window, now_dt, win_start_dt, ledger_rows, clean_rows, weekly_rates):
+def _build_attribution_buckets(
+    window, now_dt, win_start_dt, ledger_rows, clean_rows, weekly_rates, rate_preset="none"
+):
     """Build hourly (`today`/`24h`) or daily (`7d`) stacked attribution buckets."""
     buckets = []
     bmap = {}
@@ -246,7 +259,7 @@ def _build_attribution_buckets(window, now_dt, win_start_dt, ledger_rows, clean_
         b = bmap.get(key_fn(end_dt))
         if not b:
             continue
-        est_v = agy_usage.row_theoretical_weekly(r, weekly_rates)
+        est_v = agy_usage.row_theoretical_weekly(r, weekly_rates, rate_preset=rate_preset)
         if est_v is None:
             continue
         if agy_usage.is_third_party_model(r.get("model")):
@@ -302,7 +315,7 @@ def _build_attribution_buckets(window, now_dt, win_start_dt, ledger_rows, clean_
 
 
 def _build_external_bursts(
-    clean_rows, ledger_rows, weekly_rates=None, max_bursts=8, five_h_ratio=4.0
+    clean_rows, ledger_rows, weekly_rates=None, max_bursts=8, five_h_ratio=4.0, rate_preset="none"
 ):
     """
     Group consecutive external consumption minutes (gap <= 20m) into readable event bursts.
@@ -322,7 +335,7 @@ def _build_external_bursts(
         if agy_usage.is_third_party_model(r.get("model")):
             cg_intervals.append((s_ep - 60.0, e_ep + 120.0))
         else:
-            est = agy_usage.row_theoretical_weekly(r, weekly_rates)
+            est = agy_usage.row_theoretical_weekly(r, weekly_rates, rate_preset=rate_preset)
             if est is None:
                 obs_v, _ = agy_usage.turn_measured_weekly_delta(r, five_h_to_weekly=five_h_to_w)
                 est = float(obs_v or 0.0)
@@ -549,6 +562,7 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
     """Build complete JSON payload for the Extensions sidebar dashboard."""
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    rate_preset = agy_usage.get_rate_preset()
 
     live_snap = None
     live_ms = 0
@@ -581,14 +595,19 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
             ledger_rows, overlapping, all_clusters, monitor_rows=mon_all
         )
         today_sum = agy_usage.summarize_period(
-            ledger_rows, today_start, weekly_rates, five_h_to_weekly=five_h_to_w
+            ledger_rows, today_start, weekly_rates, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
         )
         week_sum = agy_usage.summarize_period(
-            ledger_rows, quota_wk_start, weekly_rates, five_h_to_weekly=five_h_to_w
+            ledger_rows, quota_wk_start, weekly_rates, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
         )
-        model_rows = _build_model_rows(ledger_rows, weekly_rates, model_samples)
+        model_rows = _build_model_rows(ledger_rows, weekly_rates, model_samples, rate_preset=rate_preset)
         recent_rows = _build_recent_rows(
-            ledger_rows, overlapping, weekly_rates, recent_n=recent_n, five_h_to_weekly=five_h_to_w
+            ledger_rows,
+            overlapping,
+            weekly_rates,
+            recent_n=recent_n,
+            five_h_to_weekly=five_h_to_w,
+            rate_preset=rate_preset,
         )
         missing_tok = sum(1 for r in ledger_rows if not (r.get("tokens") or {}).get("billedSteps"))
     else:
@@ -658,20 +677,20 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
     clean_7d = [c for c in clean_all if c["ts"] >= ts_7d]
 
     rec_today = agy_usage.reconcile_shared_pools(
-        ledger_rows, mon_all, weekly_rates, today_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w
+        ledger_rows, mon_all, weekly_rates, today_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
     )
     rec_wk_gem = agy_usage.reconcile_shared_pools(
-        ledger_rows, mon_all, weekly_rates, quota_wk_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w
+        ledger_rows, mon_all, weekly_rates, quota_wk_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
     )
     rec_wk_cg = (
         rec_wk_gem
         if cg_wk_start == quota_wk_start
         else agy_usage.reconcile_shared_pools(
-            ledger_rows, mon_all, weekly_rates, cg_wk_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w
+            ledger_rows, mon_all, weekly_rates, cg_wk_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
         )
     )
     rec_win = agy_usage.reconcile_shared_pools(
-        ledger_rows, mon_all, weekly_rates, win_start_dt, live_snap=live_snap, mon_summary=win_summary, five_h_to_weekly=five_h_to_w
+        ledger_rows, mon_all, weekly_rates, win_start_dt, live_snap=live_snap, mon_summary=win_summary, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
     )
 
     clean_win = win_summary.get("clean_rows") or []
@@ -731,6 +750,7 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
         "uiVersion": ui_version,
         "generatedAt": now.strftime("%Y-%m-%d %H:%M:%S"),
         "hookEnabled": agy_usage.get_hook_enabled(HOOKS_JSON_PATH),
+        "ratePreset": rate_preset,
         "live": {
             "source": (live_snap or {}).get("source") or "offline",
             "billingMode": billing_mode,
@@ -814,16 +834,16 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
             },
             "series": _downsample_clean_series(clean_win),
             "buckets": _build_attribution_buckets(
-                window, now, win_start_dt, ledger_rows, clean_win, weekly_rates
+                window, now, win_start_dt, ledger_rows, clean_win, weekly_rates, rate_preset=rate_preset
             ),
             "externalBursts": _build_external_bursts(
-                clean_win, ledger_rows, weekly_rates, five_h_ratio=gem_ratio
+                clean_win, ledger_rows, weekly_rates, five_h_ratio=gem_ratio, rate_preset=rate_preset
             ),
             "externalBursts24h": _build_external_bursts(
-                clean_24h, ledger_rows, weekly_rates, five_h_ratio=gem_ratio
+                clean_24h, ledger_rows, weekly_rates, five_h_ratio=gem_ratio, rate_preset=rate_preset
             ),
             "externalBursts7d": _build_external_bursts(
-                clean_7d, ledger_rows, weekly_rates, five_h_ratio=gem_ratio
+                clean_7d, ledger_rows, weekly_rates, five_h_ratio=gem_ratio, rate_preset=rate_preset
             ),
             "recentChanges": recent_changes,
         },
@@ -837,6 +857,7 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
             "pythonVersion": sys.version.split()[0],
             "billingMode": billing_mode,
             "plan": (live_snap or {}).get("plan") or "",
+            "ratePreset": rate_preset,
             "poolKeys": pool_order,
             "geminiRatio": {"ratio": round(gem_ratio, 4), "samples": gem_n, "calibrated": gem_cal},
             "cgRatio": {"ratio": round(cg_ratio, 4), "samples": cg_n, "calibrated": cg_cal},
@@ -860,7 +881,9 @@ def _render_in_memory_summary(lang="zh-CN"):
     lines = []
     if is_en:
         lines.append(f"Antigravity Usage Monitor Summary ({payload['generatedAt']})")
-        lines.append(f"Version: v{diag['version']} | Billing: {diag['billingMode']} | Gemini 5h:Weekly = {diag['geminiRatio']['ratio']:.2f}:1")
+        lines.append(
+            f"Version: v{diag['version']} | Billing: {diag['billingMode']} | Preset: {diag.get('ratePreset', 'none')} | Gemini 5h:Weekly = {diag['geminiRatio']['ratio']:.2f}:1"
+        )
         lines.append("")
         lines.append(f"[Today] Turns/Steps: {today_p['turns']}/{today_p['steps']} | Tokens: {today_p['inTok']:,}/{today_p['crTok']:,}/{today_p['outTok']:,} | Local Est: -{today_p['localEst']:.4f}%")
         lines.append(f"[This Week] Turns/Steps: {week_p['turns']}/{week_p['steps']} | Gemini Total: -{gem['poolTotal']:.3f}% (Local: -{gem['localEst']:.4f}%, External: -{gem['externalTotal']:.4f}%, Sleep: -{gem['monOffline']:.4f}%)")
@@ -868,11 +891,14 @@ def _render_in_memory_summary(lang="zh-CN"):
         lines.append("")
         lines.append("[Calibrated Models]")
         for m in payload["models"][:15]:
-            r_str = f"{m['rateWeekly']:.4f}%/1M EqIn" if m["rateWeekly"] is not None else "pending"
+            suffix = " (preset)" if m.get("rateKind") == "preset" else (" (est)" if m.get("estimated") else "")
+            r_str = f"{m['rateWeekly']:.4f}%/1M EqIn{suffix}" if m["rateWeekly"] is not None else "pending"
             lines.append(f"  - {m['model']}: {m['turns']}t/{m['steps']}s, hit={m['hitPct']:.1f}%, rate={r_str}")
     else:
         lines.append(f"Antigravity Usage Monitor 用量摘要 ({payload['generatedAt']})")
-        lines.append(f"版本: v{diag['version']} | 计费模式: {diag['billingMode']} | Gemini 5h:周 比例 = {diag['geminiRatio']['ratio']:.2f}:1")
+        lines.append(
+            f"版本: v{diag['version']} | 计费模式: {diag['billingMode']} | 单价预设: {diag.get('ratePreset', 'none')} | Gemini 5h:周 比例 = {diag['geminiRatio']['ratio']:.2f}:1"
+        )
         lines.append("")
         lines.append(f"[今日] 对话/步数: {today_p['turns']}/{today_p['steps']} | Token(In/Cache/Out): {today_p['inTok']:,}/{today_p['crTok']:,}/{today_p['outTok']:,} | 本机理论: -{today_p['localEst']:.4f}%")
         lines.append(f"[本周] 对话/步数: {week_p['turns']}/{week_p['steps']} | Gemini 全池: -{gem['poolTotal']:.3f}% (本机: -{gem['localEst']:.4f}%, 他人: -{gem['externalTotal']:.4f}%, 休眠: -{gem['monOffline']:.4f}%)")
@@ -880,7 +906,8 @@ def _render_in_memory_summary(lang="zh-CN"):
         lines.append("")
         lines.append("[已校准模型]")
         for m in payload["models"][:15]:
-            r_str = f"{m['rateWeekly']:.4f}%/1M等效" if m["rateWeekly"] is not None else "待采集"
+            suffix = " (预设)" if m.get("rateKind") == "preset" else (" (估)" if m.get("estimated") else "")
+            r_str = f"{m['rateWeekly']:.4f}%/1M等效{suffix}" if m["rateWeekly"] is not None else "待采集"
             lines.append(f"  - {m['model']}: {m['turns']}轮/{m['steps']}步, 命中={m['hitPct']:.1f}%, 单价={r_str}")
 
     return "\n".join(lines) + "\n"
@@ -916,5 +943,16 @@ def perform_action(action, params=None):
             "action": action,
             "hookEnabled": agy_usage.get_hook_enabled(HOOKS_JSON_PATH),
             "message": buf.getvalue().strip() or ("Enabled (ON)" if new_val else "Paused (OFF)"),
+        }
+    if action == "set_preset":
+        preset = str(params.get("preset") or "none").strip()
+        if preset not in agy_usage.VALID_RATE_PRESETS:
+            return {"ok": False, "error": f"invalid_preset:{preset}"}
+        chosen = agy_usage.set_rate_preset(preset)
+        return {
+            "ok": True,
+            "action": action,
+            "ratePreset": chosen,
+            "message": f"Rate preset updated: {chosen}",
         }
     return {"ok": False, "error": f"unknown_action:{action}"}
