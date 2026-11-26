@@ -27,9 +27,9 @@ def _read_version():
     manifest = os.path.join(PLUGIN_ASSETS_DIR, "plugin.json")
     try:
         with open(manifest, "r", encoding="utf-8") as f:
-            return str(json.load(f).get("version") or "0.1.1")
+            return str(json.load(f).get("version") or "0.2.0")
     except Exception:
-        return "0.1.1"
+        return "0.2.0"
 
 
 def default_plugin_dir():
@@ -280,6 +280,12 @@ def package_release(out_dir=None):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     parser = argparse.ArgumentParser(description="Manage Antigravity Usage Monitor plugin")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

@@ -962,6 +962,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         chipExtOn: '别人用的(电脑开着时)',
         chipExtOff: '电脑休眠期间',
         recNote: '按你电脑的 Token 记录算「我用的」，其余扣额计入「别人用的 / 休眠期间」。',
+        pendingPreresNote: p => `当前含未结算预扣约 ${p}%（已按本机 Token 暂修正）`,
+        tokenCorrNote: p => `已按本机 Token 修正预扣错位 ${p}%`,
         gemWeekTitle: 'Gemini 这周',
         cgWeekTitle: 'Claude/GPT 这周',
         pillIdle: '我没用电脑时',
@@ -1045,6 +1047,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         diagCal: (r, n, ok) => ok ? `${r}:1 (已校准 n=${n})` : `${r}:1 (默认兜底 n=${n})`,
         diagPools: '识别到的额度池',
         diagCounts: '本地账本 / 监控采样',
+        diagTranscriptSync: '转录补录轮次',
         diagDir: '数据存储目录',
         diagEnv: '运行环境',
         updatedAt: t => `更新于 ${t}`,
@@ -1103,6 +1106,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         chipExtOn: 'External (while awake)',
         chipExtOff: 'During sleep',
         recNote: '"Mine" is derived from local token usage; remaining pool deductions count as external / sleep.',
+        pendingPreresNote: p => `Includes ~${p}% pending pre-reservation (adjusted via local tokens)`,
+        tokenCorrNote: p => `Adjusted ${p}% pre-reservation shift via local tokens`,
         gemWeekTitle: 'Gemini Weekly',
         cgWeekTitle: 'Claude/GPT Weekly',
         pillIdle: 'While idle',
@@ -1186,6 +1191,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         diagCal: (r, n, ok) => ok ? `${r}:1 (calibrated n=${n})` : `${r}:1 (default n=${n})`,
         diagPools: 'Detected Pools',
         diagCounts: 'Ledger / Monitor Rows',
+        diagTranscriptSync: 'Transcript-Synced Turns',
         diagDir: 'Runtime Data Dir',
         diagEnv: 'Platform / Python',
         updatedAt: t => `Updated ${t}`,
@@ -1430,6 +1436,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         .replace('跨休眠剔除', 'Sleep skipped')
         .replace('假重置已剔除', 'Rollback skipped')
         .replace('跨周重置', 'Cycle reset')
+        .replace('转录补录', 'Transcript sync')
         .replace('并发重叠', 'Overlapping')
         .replace('含并发/脉冲', 'Concurrent/Spike')
         .replace('含压缩', 'Compacted')
@@ -1553,8 +1560,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           let splitHint = `<span>${esc(p.cadence === '5h' ? t.rolling5h : t.weeklyPool)}</span>`;
           const wkRec = k === 'gemini_weekly' ? gemRec : (k === 'claude_gpt_weekly' ? cgRec : null);
           if (wkRec) {
-            const loc = Math.min(used, Number(wkRec.localEst || 0));
-            const ext = Math.max(0, used - loc);
+            const baseTot = Number(wkRec.pendingPreReservation || 0) > 0.05 ? Number(wkRec.poolTotal || 0) : used;
+            const loc = Math.min(baseTot, Number(wkRec.localEst || 0));
+            const ext = Math.max(0, baseTot - loc);
             splitHint = `<span>${esc(t.poolSplitHint(fmtSpend(loc, 1), fmtSpend(ext, 1)))}</span>`;
           }
 
@@ -1583,7 +1591,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         recWk.geminiSince ? t.weekSince(recWk.geminiSince.slice(5, 16)) : '';
 
       const renderRecBlock = (title, rec, liveUsedFallback, hasFb) => {
-        const tot = Math.max(Number(rec.poolTotal || 0), Number(liveUsedFallback || 0));
+        const pendingPreres = Number(rec.pendingPreReservation || 0);
+        const tot = pendingPreres > 0.05
+          ? Number(rec.poolTotal || 0)
+          : Math.max(Number(rec.poolTotal || 0), Number(liveUsedFallback || 0));
         const rem = Math.max(0, 100 - tot);
         const loc = Number(rec.localEst || 0);
         const off = Number(rec.monOffline || 0);
@@ -1620,10 +1631,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         `;
       };
 
+      const recNotes = [t.recNote];
+      if (Number(gemRec.tokenCorrectedGw || 0) > 0.01) {
+        recNotes.push(t.tokenCorrNote(Number(gemRec.tokenCorrectedGw).toFixed(2)));
+      }
+      if (Number(gemRec.pendingPreReservation || 0) > 0.05) {
+        recNotes.push(t.pendingPreresNote(Number(gemRec.pendingPreReservation).toFixed(2)));
+      }
       document.getElementById('reconcileCard').innerHTML =
         renderRecBlock(t.gemWeekTitle, gemRec, (pools.gemini_weekly || {}).used, recWk.hasFallbackEst) +
         renderRecBlock(t.cgWeekTitle, cgRec, (pools.claude_gpt_weekly || {}).used, false) +
-        `<div class="rec-note">${esc(t.recNote)}</div>`;
+        `<div class="rec-note">${esc(recNotes.join(' · '))}</div>`;
 
       renderBurstsFeed(d);
 
@@ -2097,6 +2115,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         let stPill = `<span class="pill">${esc(stLocal)}</span>`;
         if (turn.contaminated) {
           stPill = `<span class="pill warn" title="${esc(t.contamTip)}">${esc(t.contamPill)}</span>`;
+        } else if (turn.status === '转录补录') {
+          stPill = `<span class="pill local">${esc(stLocal)}</span>`;
         } else if (turn.status === '正常') {
           stPill = `<span class="pill ok">${esc(t.normalPill)}</span>`;
         }
@@ -2124,13 +2144,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const cR = diag.cgRatio || { ratio: 4.0, samples: 0, calibrated: false };
       const poolsTxt = (diag.poolKeys && diag.poolKeys.length) ? diag.poolKeys.join(', ') : '-';
       const rows = [
-        [t.diagVer, `v${diag.version || '0.1.1'}`],
+        [t.diagVer, `v${diag.version || '0.2.0'}`],
         [t.diagBill, `${diag.billingMode || '-'}${diag.plan ? ' (' + diag.plan + ')' : ''}`],
         [t.diagPreset, t.diagPresetVal(activePreset)],
         [t.diagRatioGem, t.diagCal(Number(gR.ratio || 4).toFixed(2), gR.samples || 0, gR.calibrated)],
         [t.diagRatioCg, t.diagCal(Number(cR.ratio || 4).toFixed(2), cR.samples || 0, cR.calibrated)],
         [t.diagPools, poolsTxt],
         [t.diagCounts, `${diag.ledgerCount || 0} / ${diag.monitorCount || 0}`],
+        ...(diag.transcriptSyncTurns > 0 ? [[t.diagTranscriptSync, String(diag.transcriptSyncTurns)]] : []),
         [t.diagEnv, `${diag.platform || '-'} · Python ${diag.pythonVersion || '-'}`],
         [t.diagDir, diag.dataDir || '-'],
       ];

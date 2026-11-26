@@ -267,7 +267,8 @@ def _build_attribution_buckets(
         else:
             b["gwLocal"] += est_v
 
-    for c in clean_rows or []:
+    n_clean = len(clean_rows or [])
+    for idx, c in enumerate(clean_rows or []):
         dt = parse_local_naive(c.get("iso"))
         if not dt:
             continue
@@ -275,10 +276,47 @@ def _build_attribution_buckets(
         if not b:
             continue
         if c["dgw"] > 0:
-            if c["pool_gaps"]["gw"] > 300.0 and c["idle"]:
+            if "dgw_active" in c and "dgw_idle_on" in c and "dgw_offline" in c:
+                b["gwExtOffline"] += float(c["dgw_offline"] or 0.0)
+                active_plus_idle = float(c["dgw_active"] or 0.0) + float(c["dgw_idle_on"] or 0.0)
+                b["gwMonActiveIdle"] += active_plus_idle
+            elif c["pool_gaps"]["gw"] > 300.0 and c["idle"]:
                 b["gwExtOffline"] += c["dgw"]
             else:
-                b["gwMonActiveIdle"] += c["dgw"]
+                distributed = False
+                if c.get("raw_gw", c["gw"]) > c["gw"] + 0.01 and (idx + 1) < n_clean:
+                    plat_val = c["gw"]
+                    spanned_keys = []
+                    seen_keys = set()
+                    cur_key = b["key"]
+                    spanned_keys.append(cur_key)
+                    seen_keys.add(cur_key)
+                    for j in range(idx + 1, n_clean):
+                        cj = clean_rows[j]
+                        if cj["pool_gaps"]["gw"] > 300.0 or (cj.get("window_resets") or {}).get("gw"):
+                            break
+                        if abs(cj["gw"] - plat_val) > 1e-4:
+                            break
+                        if cj.get("raw_gw", cj["gw"]) <= plat_val + 0.01:
+                            break
+                        dt_j = parse_local_naive(cj.get("iso"))
+                        if dt_j:
+                            kj = key_fn(dt_j)
+                            if kj in bmap and kj not in seen_keys:
+                                spanned_keys.append(kj)
+                                seen_keys.add(kj)
+                    if len(spanned_keys) >= 2:
+                        sum_loc = sum(bmap[k]["gwLocal"] for k in spanned_keys)
+                        if sum_loc > 1e-5:
+                            to_spread = min(c["dgw"], sum_loc)
+                            for k in spanned_keys:
+                                bmap[k]["gwMonActiveIdle"] += to_spread * (bmap[k]["gwLocal"] / sum_loc)
+                            rem = c["dgw"] - to_spread
+                            if rem > 1e-6:
+                                b["gwMonActiveIdle"] += rem
+                            distributed = True
+                if not distributed:
+                    b["gwMonActiveIdle"] += c["dgw"]
         if c["dcw"] > 0:
             if c["pool_gaps"]["cw"] > 300.0 and c["idle"]:
                 b["cwExtOffline"] += c["dcw"]
@@ -392,41 +430,78 @@ def _build_external_bursts(
         else:
             merged_clusters.append(cl)
 
+    ratio_5h = float(five_h_ratio or 4.0)
+    cluster_deficits = []
     for cl in merged_clusters:
         mon_gw = sum(clean_rows[i]["dgw"] for i in cl["indices"])
-        if mon_gw <= 0.15:
-            continue
         local_gw = sum(
             est for s_ep, e_ep, est in gem_turns
             if e_ep >= (cl["start"] - 30.0) and s_ep <= (cl["end"] + 90.0)
         )
         excess = mon_gw - local_gw
-        if excess > 0.15:
+        if mon_gw > 0.15 and excess > 0.15:
             for i in cl["indices"]:
                 dgw_i = clean_rows[i]["dgw"]
                 if dgw_i > 1e-4:
                     conc_gw = excess * (dgw_i / mon_gw)
-                    conc_g5 = min(clean_rows[i]["dg5"], conc_gw * float(five_h_ratio or 4.0))
+                    conc_g5 = min(clean_rows[i]["dg5"], conc_gw * ratio_5h)
                     conc_map[i] = (conc_gw, conc_g5)
+        elif (-excess) > 0.15:
+            cluster_deficits.append({"start": cl["start"], "remainingDeficit": -excess})
 
     events = []
     for idx, c in enumerate(clean_rows or []):
         conc_gw, conc_g5 = conc_map.get(idx, (0.0, 0.0))
-        is_idle_or_off_gem = (c["dgw"] > 1e-4 or c["dg5"] > 0.01) and (
-            c["idle"] or c["pool_gaps"]["gw"] > 300.0
-        )
+        has_token_corr = "dgw_idle_on" in c
+        is_off_gem = bool(c["pool_gaps"]["gw"] > 300.0 and c["idle"])
+        if has_token_corr:
+            idle_gem_gw = float(c["dgw_offline"] if is_off_gem else c["dgw_idle_on"])
+            idle_gem_g5 = (
+                float(c["dg5"]) * (idle_gem_gw / float(c["dgw"]))
+                if float(c.get("dgw") or 0.0) > 1e-6
+                else (float(c["dg5"]) if c["idle"] and idle_gem_gw > 1e-4 else 0.0)
+            )
+            is_idle_or_off_gem = (
+                idle_gem_gw > 1e-4 or (idle_gem_g5 > 0.01 and not c.get("token_corrected_gw"))
+            ) and (c["idle"] or is_off_gem)
+        else:
+            idle_gem_gw = float(c["dgw"])
+            idle_gem_g5 = float(c["dg5"])
+            is_idle_or_off_gem = (c["dgw"] > 1e-4 or c["dg5"] > 0.01) and (c["idle"] or is_off_gem)
+
         is_conc_gem = conc_gw > 1e-4
+        gem_gw_add = idle_gem_gw if is_idle_or_off_gem else conc_gw
+        gem_g5_add = idle_gem_g5 if is_idle_or_off_gem else conc_g5
+
+        # Fallback for direct callers without pre-applied `apply_local_token_correction`:
+        if (
+            not has_token_corr
+            and is_idle_or_off_gem
+            and c["idle"]
+            and not is_off_gem
+            and 0.98 <= c["dgw"] <= 1.05
+            and 0.98 <= c["dg5"] <= 1.05
+            and abs(c["dg5"] - c["dgw"]) <= 0.05
+        ):
+            for dcl in cluster_deficits:
+                if dcl["remainingDeficit"] > 0.15 and 0.0 < (dcl["start"] - c["ts"]) <= 600.0:
+                    absorbed = min(gem_gw_add, dcl["remainingDeficit"])
+                    dcl["remainingDeficit"] -= absorbed
+                    gem_gw_add = max(0.0, gem_gw_add - absorbed)
+                    gem_g5_add = 0.0 if gem_gw_add < 0.02 else max(0.0, gem_g5_add - absorbed * ratio_5h)
+                    break
+            if gem_gw_add < 1e-4 and gem_g5_add < 0.01:
+                is_idle_or_off_gem = False
+
         is_gem_ext = is_idle_or_off_gem or is_conc_gem
         is_cg_ext = (c["dcw"] > 1e-4 or c["dc5"] > 0.01) and (
             c["idle"] or c["pool_gaps"]["cw"] > 300.0 or not _has_local_cg(c["ts"])
         )
         if not (is_gem_ext or is_cg_ext):
             continue
-        is_off = (is_idle_or_off_gem and c["pool_gaps"]["gw"] > 300.0) or (
+        is_off = (is_idle_or_off_gem and is_off_gem) or (
             is_cg_ext and c["pool_gaps"]["cw"] > 300.0
         )
-        gem_gw_add = c["dgw"] if is_idle_or_off_gem else conc_gw
-        gem_g5_add = c["dg5"] if is_idle_or_off_gem else conc_g5
         events.append(
             (
                 c,
@@ -668,29 +743,57 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
 
     cutoff_ts = win_start_dt.timestamp()
     mon_win = [r for r in mon_all if agy_monitor._row_ts(r) >= cutoff_ts]
-    win_summary = agy_monitor.summarize_monitor_rows(mon_win, all_rows=mon_all, since_ts=cutoff_ts)
-    all_summary = agy_monitor.summarize_monitor_rows(mon_all)
-    clean_all = all_summary.get("clean_rows") or []
+    raw_clean_all = agy_monitor.clean_monitor_timeline(mon_all, five_h_to_weekly=five_h_to_w)
+    clean_all, _corr_meta = agy_usage.apply_local_token_correction(
+        raw_clean_all,
+        ledger_rows,
+        weekly_rates,
+        five_h_to_weekly=five_h_to_w,
+        rate_preset=rate_preset,
+    )
+    win_summary = agy_monitor.summarize_clean_rows(mon_win, clean_all, since_ts=cutoff_ts)
+    all_summary = agy_monitor.summarize_clean_rows(mon_all, clean_all)
+    today_mon_summary = agy_monitor.summarize_clean_rows(
+        mon_all, clean_all, since_ts=today_start.timestamp()
+    )
+    wk_gem_summary = agy_monitor.summarize_clean_rows(
+        mon_all, clean_all, since_ts=quota_wk_start.timestamp()
+    )
+    wk_cg_summary = (
+        wk_gem_summary
+        if cg_wk_start == quota_wk_start
+        else agy_monitor.summarize_clean_rows(
+            mon_all, clean_all, since_ts=cg_wk_start.timestamp()
+        )
+    )
     ts_24h = (now - timedelta(hours=24)).timestamp()
     ts_7d = (now - timedelta(days=7)).timestamp()
     clean_24h = [c for c in clean_all if c["ts"] >= ts_24h]
     clean_7d = [c for c in clean_all if c["ts"] >= ts_7d]
 
     rec_today = agy_usage.reconcile_shared_pools(
-        ledger_rows, mon_all, weekly_rates, today_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+        ledger_rows, mon_all, weekly_rates, today_start,
+        live_snap=live_snap, mon_summary=today_mon_summary,
+        five_h_to_weekly=five_h_to_w, rate_preset=rate_preset,
     )
     rec_wk_gem = agy_usage.reconcile_shared_pools(
-        ledger_rows, mon_all, weekly_rates, quota_wk_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+        ledger_rows, mon_all, weekly_rates, quota_wk_start,
+        live_snap=live_snap, mon_summary=wk_gem_summary,
+        five_h_to_weekly=five_h_to_w, rate_preset=rate_preset,
     )
     rec_wk_cg = (
         rec_wk_gem
         if cg_wk_start == quota_wk_start
         else agy_usage.reconcile_shared_pools(
-            ledger_rows, mon_all, weekly_rates, cg_wk_start, live_snap=live_snap, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+            ledger_rows, mon_all, weekly_rates, cg_wk_start,
+            live_snap=live_snap, mon_summary=wk_cg_summary,
+            five_h_to_weekly=five_h_to_w, rate_preset=rate_preset,
         )
     )
     rec_win = agy_usage.reconcile_shared_pools(
-        ledger_rows, mon_all, weekly_rates, win_start_dt, live_snap=live_snap, mon_summary=win_summary, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+        ledger_rows, mon_all, weekly_rates, win_start_dt,
+        live_snap=live_snap, mon_summary=win_summary,
+        five_h_to_weekly=five_h_to_w, rate_preset=rate_preset,
     )
 
     clean_win = win_summary.get("clean_rows") or []
@@ -744,6 +847,13 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
         ui_version = str(int(os.stat(os.path.join(SRC_DIR, "dashboard_ui.py")).st_mtime))
     except OSError:
         pass
+
+    recent_fail_streak = 0
+    for r in reversed(mon_all):
+        if r.get("ok"):
+            break
+        recent_fail_streak += 1
+    transcript_sync_turns = sum(1 for r in ledger_rows if r.get("status") == "transcript_only")
 
     return {
         "ok": True,
@@ -862,7 +972,9 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
             "geminiRatio": {"ratio": round(gem_ratio, 4), "samples": gem_n, "calibrated": gem_cal},
             "cgRatio": {"ratio": round(cg_ratio, 4), "samples": cg_n, "calibrated": cg_cal},
             "ledgerCount": len(ledger_rows),
+            "transcriptSyncTurns": transcript_sync_turns,
             "monitorCount": len(mon_all),
+            "consecutiveMonFailures": recent_fail_streak,
         },
     }
 
@@ -887,6 +999,10 @@ def _render_in_memory_summary(lang="zh-CN"):
         lines.append("")
         lines.append(f"[Today] Turns/Steps: {today_p['turns']}/{today_p['steps']} | Tokens: {today_p['inTok']:,}/{today_p['crTok']:,}/{today_p['outTok']:,} | Local Est: -{today_p['localEst']:.4f}%")
         lines.append(f"[This Week] Turns/Steps: {week_p['turns']}/{week_p['steps']} | Gemini Total: -{gem['poolTotal']:.3f}% (Local: -{gem['localEst']:.4f}%, External: -{gem['externalTotal']:.4f}%, Sleep: -{gem['monOffline']:.4f}%)")
+        if float(gem.get("tokenCorrectedGw") or 0.0) > 0.01:
+            lines.append(f"  * Adjusted {gem['tokenCorrectedGw']:.2f}% pre-reservation shift via local tokens")
+        if float(gem.get("pendingPreReservation") or 0.0) > 0.05:
+            lines.append(f"  * Tail includes ~{gem['pendingPreReservation']:.2f}% pending pre-reservation (stripped via local tokens)")
         lines.append(f"[Claude/GPT Week] Total: -{cg['poolTotal']:.3f}% (Local: -{cg['localEst']:.4f}%, External: -{cg['externalTotal']:.4f}%)")
         lines.append("")
         lines.append("[Calibrated Models]")
@@ -902,6 +1018,10 @@ def _render_in_memory_summary(lang="zh-CN"):
         lines.append("")
         lines.append(f"[今日] 对话/步数: {today_p['turns']}/{today_p['steps']} | Token(In/Cache/Out): {today_p['inTok']:,}/{today_p['crTok']:,}/{today_p['outTok']:,} | 本机理论: -{today_p['localEst']:.4f}%")
         lines.append(f"[本周] 对话/步数: {week_p['turns']}/{week_p['steps']} | Gemini 全池: -{gem['poolTotal']:.3f}% (本机: -{gem['localEst']:.4f}%, 他人: -{gem['externalTotal']:.4f}%, 休眠: -{gem['monOffline']:.4f}%)")
+        if float(gem.get("tokenCorrectedGw") or 0.0) > 0.01:
+            lines.append(f"  * 已按本机 Token 修正预扣错位 {gem['tokenCorrectedGw']:.2f}%")
+        if float(gem.get("pendingPreReservation") or 0.0) > 0.05:
+            lines.append(f"  * 当前尾部含未结算预扣约 {gem['pendingPreReservation']:.2f}%（已按 Token 暂扣除）")
         lines.append(f"[Claude/GPT 本周] 全池: -{cg['poolTotal']:.3f}% (本机: -{cg['localEst']:.4f}%, 他人: -{cg['externalTotal']:.4f}%)")
         lines.append("")
         lines.append("[已校准模型]")

@@ -32,6 +32,7 @@ import dashboard_ui
 from paths import DATA_DIR, PRELOAD_CANDIDATES, SIDECAR_STATE_PATH
 
 TICK_INTERVAL_SEC = 60.0
+TRANSCRIPT_SYNC_INTERVAL_SEC = 600.0
 
 _WEB_RELOAD_LOCK = threading.Lock()
 _WEB_MTIMES = {}
@@ -118,6 +119,7 @@ class _DaemonState:
         self.stop_event = threading.Event()
         self.last_tick_ts = 0.0
         self.last_tick_iso = ""
+        self.last_transcript_sync_ts = 0.0
         self.port = 0
         self.ui_token = ""
         self.preload_js = b"// preload unavailable\n"
@@ -267,6 +269,15 @@ def _ticker_loop():
                 STATE.last_tick_iso = str((rec or {}).get("iso") or "")
             except Exception:
                 STATE.last_tick_ts = time.time()
+        if (
+            STATE.last_transcript_sync_ts <= 0.0
+            or (now - STATE.last_transcript_sync_ts) >= TRANSCRIPT_SYNC_INTERVAL_SEC
+        ):
+            try:
+                agy_usage.sync_untracked_transcripts()
+            except Exception:
+                pass
+            STATE.last_transcript_sync_ts = time.time()
         STATE.stop_event.wait(2.0)
 
 

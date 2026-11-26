@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.2.0 (2026-11-26)
+
+### Improved & Fixed
+- **Multi-Pass Monitor Denoiser (Pass 1.5 & Pass 3)**:
+  - Added **Pass 1.5** invariant pre-reservation pairing (`inv = gw - ratio * g5`): pairs exact 1-tick replica bounces, LIFO transient returns (`<= 30m`), LIFO short active closes (`<= 5m`), and FIFO TTL expirations (`<= 6h`) with an idle-teleport guard, restoring real settled spend to its true origin tick while automatically skipping weekly-only accounts.
+  - Added **Pass 3** active-aware anchor alignment for weekly pools so clamped local active rises never teleport backward onto a preceding idle spike.
+  - Added Pass-1 multi-tick plateau lookahead and empty-`resetsAt` stale-replica retirement (`retired_ep` + 15-minute post-reset bounce guard + clean cycle week-start detection).
+- **Post-Usage Local-Token Correction (`Rule A` + `Rule B`)**:
+  - **Rule B**: Strips stacked live-tail un-settled Gemini pre-reservations interleaved with `5h`-only offsets using local token floors (`gw_before + local_since`), displaying a transparent pending pre-reservation note in the Overview card and `.txt` summary without overriding adjusted weekly totals.
+  - **Rule A**: Re-attributes idle/clamped pre-reservation spikes preceding or overlapping local sessions back to local consumption when completed turns show `localEst > monActive`, enforcing exact conservation (`externalTotal = monIdleOnline + monOffline + externalConcurrent`).
+- **Automatic Transcript Recovery & Hook First-Step Fix**:
+  - Sidecar background loop (`600s` interval) and `--backfill` now recover untracked settled local turns (`transcript_only`) such as subagent waves, interrupted turns, or Hook-OFF sessions with step-index + time-window deduplication (excluded cleanly from model-rate calibration).
+  - Fixed `hook.py` ignoring 0-token placeholder steps before `PreInvocation`, tightened `seen_steps` deduplication, added empty-`resetsAt` mid-turn reset detection, and added optional `fcntl.flock` ledger append locking on POSIX platforms.
+- **Cross-Platform CLI & CI Stability**:
+  - Added `ensure_utf8_stdio()` and `safe_print()` so Windows narrow consoles (`cp1252`) never fail with `UnicodeEncodeError` when printing Chinese CLI summaries.
+  - Updated GitHub Actions matrix (`ubuntu-latest` `3.11`/`3.12`, `macos-latest` & `windows-latest` `3.9`/`3.12`).
+
 ## v0.1.1 (2026-11-23)
 
 ### Added

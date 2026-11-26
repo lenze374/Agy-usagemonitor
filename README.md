@@ -10,8 +10,8 @@ Designed specifically for users who share an Antigravity subscription across mul
 
 ## Key Capabilities
 
-- **Closed-Loop Shared-Pool Reconciliation**: Combines local Hook token telemetry (`PreInvocation` / `Stop` + `transcript.jsonl`) with 1-minute Language Server quota polling (`RetrieveUserQuotaSummary`) to separate **Mine** from **External (while awake)**, **Concurrent**, and **During sleep**.
-- **2-Pass Watermark Denoiser**: Eliminates transient server pre-reservation pulses/rollbacks, stale backward `resetsAt` replica flaps, and isolated 1–2 tick downward dips without locking artificial high-water marks.
+- **Closed-Loop Shared-Pool Reconciliation**: Combines local Hook token telemetry (`PreInvocation` / `Stop` + `transcript.jsonl`, plus automatic background recovery of untracked subagent/interrupted transcripts) with 1-minute Language Server quota polling (`RetrieveUserQuotaSummary`) and post-usage local-token correction (`Rule A/B`) to separate **Mine** from **External (while awake)**, **Concurrent**, and **During sleep**.
+- **Multi-Pass Watermark Denoiser**: Eliminates transient server pre-reservation pulses/rollbacks via **Pass 1.5** invariant pairing (`inv = gw - ratio * g5`), **Pass 3** active-aware anchor alignment, stale `resetsAt` replica retirement, and isolated 1–2 tick dip repair without locking artificial high-water marks.
 - **Quiet-Window Golden Calibration**: Automatically infers each model's weekly burn rate (`% per 1M Equivalent Input` with `In:Cache:Out = 1:0.05:5`), excludes `search_web` / error steps from Pass 1, solves residual rates from clean mixed-model turns in Pass 2, and tracks per-step `model` usage (including subagents).
 - **Multi-Subscription & Multi-Tier Support**:
   - Dynamically renders all quota buckets returned by the host (e.g. `Gemini 5h/Weekly`, `Argon Weekly`, `Claude/GPT 5h/Weekly`, and future buckets).

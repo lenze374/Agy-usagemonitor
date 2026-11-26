@@ -13,6 +13,11 @@ import sys
 import time
 from datetime import datetime
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 SRC_DIR = os.path.dirname(os.path.realpath(__file__))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
@@ -62,7 +67,7 @@ def resolve_transcript_path(payload, conv_id):
 
 
 def get_transcript_max_step(path):
-    """Return highest step_index currently present in transcript.jsonl, or -1 if absent/empty."""
+    """Return highest already-billed step_index in transcript.jsonl, or -1 if absent/empty."""
     if not path or not os.path.isfile(path):
         return -1
     max_step = -1
@@ -74,10 +79,18 @@ def get_transcript_max_step(path):
                     continue
                 try:
                     obj = json.loads(line)
-                    if isinstance(obj, dict) and obj.get("step_index") is not None:
-                        idx = int(obj["step_index"])
-                        if idx > max_step:
-                            max_step = idx
+                    if not isinstance(obj, dict) or obj.get("step_index") is None:
+                        continue
+                    billed_toks = (
+                        int(obj.get("input_tokens") or 0)
+                        + int(obj.get("cache_read_tokens") or 0)
+                        + int(obj.get("output_tokens") or 0)
+                    )
+                    if billed_toks <= 0:
+                        continue
+                    idx = int(obj["step_index"])
+                    if idx > max_step:
+                        max_step = idx
                 except Exception:
                     continue
     except Exception:
@@ -147,8 +160,6 @@ def collect_turn_tokens(path, start_step_index=None, start_ts=None, end_ts=None)
                     if max_epoch is not None and c_epoch > max_epoch:
                         continue
 
-                seen_steps.add(step_idx)
-
                 if str(obj.get("status") or "").upper() == "ERROR" or bool(obj.get("error")):
                     error_steps += 1
                 for tc in obj.get("tool_calls") or []:
@@ -165,6 +176,7 @@ def collect_turn_tokens(path, start_step_index=None, start_ts=None, end_ts=None)
                 out_t = int(obj.get("output_tokens") or 0)
                 if in_t <= 0 and cr_t <= 0 and out_t <= 0:
                     continue
+                seen_steps.add(step_idx)
 
                 step_rec = {
                     "step": step_idx,
@@ -278,7 +290,11 @@ def compute_pool_delta(start_pool, end_pool):
     s_reset = start_pool.get("resetsAt") or ""
     e_reset = end_pool.get("resetsAt") or ""
 
-    if s_val > 1e-5 and ((s_reset and e_reset and s_reset != e_reset) or (e_val < s_val - 1e-5)):
+    if s_val > 1e-5 and (
+        (s_reset and e_reset and s_reset != e_reset)
+        or (e_val <= 0.1 and s_reset and not e_reset)
+        or (e_val < s_val - 1e-5)
+    ):
         return {
             "start": round(s_val, 6),
             "end": round(e_val, 6),
@@ -366,6 +382,15 @@ def handle_stop(payload):
         str(workspaces[0]).rstrip("/\\") if workspaces else ""
     )
 
+    g5_pool = deltas.get("gemini_5h") or {}
+    gw_pool = deltas.get("gemini_weekly") or {}
+    pre_res_suspected = False
+    if g5_pool.get("start") is not None and gw_pool.get("start") is not None:
+        g5_d = float(g5_pool.get("delta") or 0.0)
+        gw_d = float(gw_pool.get("delta") or 0.0)
+        if (not gw_pool.get("reset")) and (not g5_pool.get("reset")) and (gw_d - g5_d * 0.25) >= 0.45:
+            pre_res_suspected = True
+
     entry = {
         "ts": end_ts,
         "startTs": round(start_ts_val, 3),
@@ -386,10 +411,25 @@ def handle_stop(payload):
         "tokenSteps": token_steps,
         "pools": deltas,
     }
+    if pre_res_suspected:
+        entry["preReservationSuspected"] = True
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(LEDGER_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    lock_fd = None
+    try:
+        if fcntl is not None:
+            lock_fd = open(LEDGER_PATH + ".lock", "a+", encoding="utf-8")
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        with open(LEDGER_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    finally:
+        if lock_fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
 
 
 def main():

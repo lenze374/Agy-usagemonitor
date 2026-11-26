@@ -5,7 +5,7 @@ description: Inspect Antigravity shared-pool quota reconciliation, 1-minute deno
 
 # Antigravity Usage Monitor (`agy-usage`)
 
-Zero-dependency local telemetry & shared-pool accounting plugin for Google Antigravity (`v0.1.1`).
+Zero-dependency local telemetry & shared-pool accounting plugin for Google Antigravity (`v0.2.0`).
 
 ## Where Data Lives
 

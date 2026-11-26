@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Comprehensive cross-platform unit tests for Antigravity Usage Monitor (v0.1.1)."""
+"""Comprehensive cross-platform unit tests for Antigravity Usage Monitor (v0.2.0)."""
 
 import hashlib
 import importlib
@@ -639,14 +639,14 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertEqual(len(chgs), 1)
         self.assertAlmostEqual(chgs[0]["dgw"], 0.10, places=4)
         self.assertIn("diagnostics", payload)
-        self.assertEqual(payload["diagnostics"]["version"], "0.1.1")
+        self.assertEqual(payload["diagnostics"]["version"], "0.2.0")
 
         # Verify in-memory summary generation writes zero files
         before_files = set(os.listdir(self.data_dir))
         for lang in ("zh-CN", "en"):
             res = self.dashboard_data.perform_action("export_summary", {"lang": lang})
             self.assertTrue(res["ok"])
-            self.assertIn("0.1.1", res["content"])
+            self.assertIn("0.2.0", res["content"])
         self.assertEqual(set(os.listdir(self.data_dir)), before_files)
 
         # Verify bilingual UI markers & zero host CSS regressions
@@ -707,9 +707,9 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(pkg["sha256Path"]))
         with zipfile.ZipFile(pkg["zipPath"], "r") as zf:
             names = set(zf.namelist())
-            self.assertIn("agy-usagemonitor-0.1.1/src/sidecar_daemon.py", names)
-            self.assertIn("agy-usagemonitor-0.1.1/scripts/manage.py", names)
-            self.assertIn("agy-usagemonitor-0.1.1/plugin/plugin.json", names)
+            self.assertIn("agy-usagemonitor-0.2.0/src/sidecar_daemon.py", names)
+            self.assertIn("agy-usagemonitor-0.2.0/scripts/manage.py", names)
+            self.assertIn("agy-usagemonitor-0.2.0/plugin/plugin.json", names)
 
         h = hashlib.sha256()
         with open(pkg["zipPath"], "rb") as f:
@@ -799,6 +799,191 @@ class AgyUsageMonitorTests(unittest.TestCase):
         html = self.dashboard_ui.DASHBOARD_HTML
         self.assertIn("presetSelect", html)
         self.assertIn("set_preset", html)
+
+    def test_pass15_gemini_prereservation_pairing_and_weekly_only_guard(self):
+        # Delayed >2h rollback should restore settled real spend back to its active origin ticks,
+        # erase 1-tick exact bounces, and skip weekly-only segments without a 5h pool.
+        base_ts = 1795500000.0
+        resets_ok = {"g5": "2099-01-01T14:00:00Z", "gw": "2099-01-07T07:00:00Z", "c5": "", "cw": ""}
+        rows = [
+            {"ts": base_ts + 0.0, "iso": "2026-11-26T09:20:00+08:00", "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 0.0, "gw": 1.0000, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            # 1-tick exact replica bounce
+            {"ts": base_ts + 60.0, "iso": "2026-11-26T09:21:00+08:00", "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 0.4, "gw": 1.8000, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            {"ts": base_ts + 120.0, "iso": "2026-11-26T09:22:00+08:00", "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 0.0, "gw": 1.0000, "c5": 0.0, "cw": 0.0, "events": ["rollback:gw(-0.8000%)"], "resets": resets_ok},
+            # Pre-reservation #1 (+1.0000%) + real active spend (+0.2211% gw, +0.8844% g5)
+            {"ts": base_ts + 180.0, "iso": "2026-11-26T09:23:00+08:00", "ok": True, "idleSec": 10.0, "localActive": 1, "g5": 0.8844, "gw": 2.2211, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            # Pre-reservation #2 + real active spend (+0.1544% gw, +0.6176% g5)
+            {"ts": base_ts + 2580.0, "iso": "2026-11-26T10:03:00+08:00", "ok": True, "idleSec": 10.0, "localActive": 1, "g5": 1.5020, "gw": 2.3755, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            # Delayed TTL refund of 1.0000%
+            {"ts": base_ts + 9000.0, "iso": "2026-11-26T11:50:00+08:00", "ok": True, "idleSec": 300.0, "localActive": 0, "g5": 1.5020, "gw": 1.3755, "c5": 0.0, "cw": 0.0, "events": ["rollback:gw(-1.0000%)"], "resets": resets_ok},
+        ]
+        tl = self.agy_monitor.clean_monitor_timeline(rows, five_h_to_weekly=0.25)
+        self.assertEqual(tl[1]["dgw"], 0.0)
+        self.assertAlmostEqual(tl[3]["dgw"], 0.2211, places=4)
+        self.assertTrue(tl[3]["preres_paired"])
+        self.assertAlmostEqual(tl[4]["dgw"], 0.1544, places=4)
+        self.assertAlmostEqual(tl[-1]["gw"], 1.3755, places=4)
+
+        # Weekly-only guard: when g5 is empty/absent, Pass 1.5b must not mis-classify weekly ticks
+        wk_resets = {"g5": "", "gw": "2099-01-07T07:00:00Z", "c5": "", "cw": ""}
+        wk_rows = [
+            {"ts": base_ts + 0.0, "iso": "2026-11-26T09:00:00+08:00", "ok": True, "idleSec": 10.0, "localActive": 1, "g5": 0.0, "gw": 1.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": wk_resets},
+            {"ts": base_ts + 60.0, "iso": "2026-11-26T09:01:00+08:00", "ok": True, "idleSec": 10.0, "localActive": 1, "g5": 0.0, "gw": 2.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": wk_resets},
+            {"ts": base_ts + 120.0, "iso": "2026-11-26T09:02:00+08:00", "ok": True, "idleSec": 10.0, "localActive": 1, "g5": 0.0, "gw": 2.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": wk_resets},
+        ]
+        wk_tl = self.agy_monitor.clean_monitor_timeline(wk_rows, five_h_to_weekly=0.25)
+        self.assertEqual(wk_tl[1]["unmatched_preres_open_gw"], 0.0)
+        self.assertFalse(wk_tl[1]["preres_paired"])
+
+    def test_pass3_active_aware_anchor_alignment_prevents_idle_teleport(self):
+        base_ts = 1795600000.0
+        resets_ok = {"g5": "2099-01-01T14:00:00Z", "gw": "2099-01-07T07:00:00Z", "c5": "", "cw": ""}
+        rows = [
+            {"ts": base_ts + 0.0, "iso": "2026-11-25T22:20:00+08:00", "ok": True, "idleSec": 400.0, "localActive": 0, "g5": 0.0, "gw": 5.00, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            # Idle pre-reservation spike before local active turn
+            {"ts": base_ts + 60.0, "iso": "2026-11-25T22:21:00+08:00", "ok": True, "idleSec": 460.0, "localActive": 0, "g5": 1.0, "gw": 6.00, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            # Local active turn starts while raw_gw still elevated, later settles at 5.20
+            {"ts": base_ts + 120.0, "iso": "2026-11-25T22:22:00+08:00", "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 1.8, "gw": 6.20, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            {"ts": base_ts + 180.0, "iso": "2026-11-25T22:23:00+08:00", "ok": True, "idleSec": 10.0, "localActive": 1, "g5": 0.8, "gw": 5.20, "c5": 0.0, "cw": 0.0, "events": ["rollback:gw(-1.0000%)"], "resets": resets_ok},
+        ]
+        tl = self.agy_monitor.clean_monitor_timeline(rows, five_h_to_weekly=0.25)
+        self.assertAlmostEqual(tl[1]["dgw"], 0.0, places=5)
+        self.assertAlmostEqual(tl[2]["dgw"], 0.20, places=5)
+
+    def test_empty_resets_at_stale_replica_and_week_start_detection(self):
+        base_ts = 1795700000.0
+        rows = [
+            {"ts": base_ts, "iso": "2026-11-25T00:34:00+08:00", "ok": True, "idleSec": 500.0, "localActive": 0, "g5": 0.0, "gw": 40.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": {"g5": "", "gw": "2026-11-25T00:35:00Z", "c5": "", "cw": ""}},
+            # Genuine reset where backend temporarily returns empty resetsAt
+            {"ts": base_ts + 60.0, "iso": "2026-11-25T00:35:00+08:00", "ok": True, "idleSec": 560.0, "localActive": 0, "g5": 0.0, "gw": 0.0, "c5": 0.0, "cw": 0.0, "events": ["reset:gw"], "resets": {"g5": "", "gw": "", "c5": "", "cw": ""}},
+            # Stale replica flaps back with old value and old resetsAt within 15m
+            {"ts": base_ts + 120.0, "iso": "2026-11-25T00:36:00+08:00", "ok": True, "idleSec": 620.0, "localActive": 0, "g5": 0.0, "gw": 40.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": {"g5": "", "gw": "2026-11-25T00:35:00Z", "c5": "", "cw": ""}},
+            # Settled new cycle
+            {"ts": base_ts + 240.0, "iso": "2026-11-25T00:38:00+08:00", "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 0.8, "gw": 0.2, "c5": 0.0, "cw": 0.0, "events": [], "resets": {"g5": "", "gw": "2026-12-02T00:38:00Z", "c5": "", "cw": ""}},
+        ]
+        s = self.agy_monitor.summarize_monitor_rows(rows)
+        self.assertAlmostEqual(s["pool_up"]["gw"], 0.2, places=4)
+        wk_start = self.agy_usage.detect_quota_week_start([], datetime(2026, 11, 20), monitor_rows=rows, pool_key="gemini_weekly")
+        # 2026-12-02T00:38:00Z minus 7 days -> local naive November 25 UTC equivalent
+        self.assertEqual(wk_start.day, 25)
+
+    def test_local_token_correction_rule_a_and_multi_stacked_rule_b(self):
+        base_ts = 1795800000.0
+        resets_ok = {"g5": "2099-01-01T14:00:00Z", "gw": "2099-01-07T07:00:00Z", "c5": "", "cw": ""}
+        rows = [
+            {"ts": base_ts + 0.0, "iso": datetime.fromtimestamp(base_ts).astimezone().isoformat(timespec="seconds"), "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 0.0, "gw": 0.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            # Two stacked +1.0% pre-reservations interleaved with -0.25 g5-only offsets, plus 0.15% real local turn
+            {"ts": base_ts + 60.0, "iso": datetime.fromtimestamp(base_ts + 60.0).astimezone().isoformat(timespec="seconds"), "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 1.0, "gw": 1.0, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            {"ts": base_ts + 120.0, "iso": datetime.fromtimestamp(base_ts + 120.0).astimezone().isoformat(timespec="seconds"), "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 1.4, "gw": 1.15, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+            {"ts": base_ts + 180.0, "iso": datetime.fromtimestamp(base_ts + 180.0).astimezone().isoformat(timespec="seconds"), "ok": True, "idleSec": 5.0, "localActive": 1, "g5": 2.4, "gw": 2.15, "c5": 0.0, "cw": 0.0, "events": [], "resets": resets_ok},
+        ]
+        # Ultra 5x preset gives 0.25%/1M EqIn for hydrogen; 600k uncached input -> 0.15% theoretical local
+        ledger = [
+            {
+                "ts": base_ts + 125.0,
+                "startTs": base_ts + 65.0,
+                "startIso": datetime.fromtimestamp(base_ts + 65.0).astimezone().isoformat(timespec="seconds"),
+                "endIso": datetime.fromtimestamp(base_ts + 125.0).astimezone().isoformat(timespec="seconds"),
+                "model": "gemini-4-hydrogen-high",
+                "status": "ok",
+                "invocations": 1,
+                "tokens": {"input": 600000, "cacheRead": 0, "output": 0, "billedSteps": 1},
+                "pools": {
+                    "gemini_5h": {"start": 1.0, "end": 1.4, "delta": 0.4, "reset": False, "resetsAt": resets_ok["g5"]},
+                    "gemini_weekly": {"start": 1.0, "end": 1.15, "delta": 0.15, "reset": False, "resetsAt": resets_ok["gw"]},
+                },
+            }
+        ]
+        self.agy_usage.annotate_pool_anomalies(ledger)
+        rec = self.agy_usage.reconcile_shared_pools(
+            ledger,
+            rows,
+            {},
+            datetime.fromtimestamp(base_ts - 60.0),
+            five_h_to_weekly=0.25,
+            rate_preset="ultra_5x",
+        )
+        gem = rec["gemini"]
+        self.assertAlmostEqual(gem["localEst"], 0.15, places=3)
+        self.assertAlmostEqual(gem["poolTotal"], 0.15, places=3)
+        self.assertAlmostEqual(gem["externalTotal"], 0.0, places=3)
+        self.assertGreater(gem["pendingPreReservation"], 1.9)
+        self.assertAlmostEqual(
+            gem["externalTotal"],
+            gem["monIdleOnline"] + gem["monOffline"] + gem["externalConcurrent"],
+            places=3,
+        )
+
+    def test_hook_placeholder_step_and_transcript_auto_sync(self):
+        brain_tmp = os.path.join(self.tmp.name, "brain_sync")
+        conv_uuid = "sync1234-aaaa-bbbb-cccc-ddddeeeeffff"
+        conv_dir = os.path.join(brain_tmp, conv_uuid, ".system_generated", "logs")
+        os.makedirs(conv_dir, exist_ok=True)
+        tp = os.path.join(conv_dir, "transcript.jsonl")
+        now_ep = time.time() - 300.0
+        lines = [
+            # Placeholder zero-token step must be ignored by get_transcript_max_step and seen_steps
+            {"step_index": 0, "type": "USER_INPUT", "created_at": datetime.fromtimestamp(now_ep - 20).astimezone().isoformat(timespec="seconds")},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": datetime.fromtimestamp(now_ep - 10).astimezone().isoformat(timespec="seconds"), "model": "gemini-4-hydrogen-high", "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0},
+        ]
+        with open(tp, "w", encoding="utf-8") as f:
+            for item in lines:
+                f.write(json.dumps(item) + "\n")
+
+        hook_mod = sys.modules["hook"]
+        self.assertEqual(hook_mod.get_transcript_max_step(tp), -1)
+
+        # Append billed update to step 1 plus step 2 (untracked turn)
+        with open(tp, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": datetime.fromtimestamp(now_ep - 8).astimezone().isoformat(timespec="seconds"), "model": "gemini-4-hydrogen-high", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 1000}) + "\n")
+            f.write(json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": datetime.fromtimestamp(now_ep).astimezone().isoformat(timespec="seconds"), "model": "gemini-4-neon-high", "input_tokens": 20000, "cache_read_tokens": 0, "output_tokens": 500}) + "\n")
+
+        summary, steps = hook_mod.collect_turn_tokens(tp, start_step_index=-1)
+        self.assertEqual(summary["billedSteps"], 2)
+        self.assertEqual([s["step"] for s in steps], [1, 2])
+
+        # Verify compute_pool_delta handles empty e_reset reset
+        rst = hook_mod.compute_pool_delta(
+            {"usedPercent": 42.0, "resetsAt": "2026-11-25T00:00:00Z"},
+            {"usedPercent": 0.0, "resetsAt": ""},
+        )
+        self.assertTrue(rst["reset"])
+        self.assertEqual(rst["delta"], 0.0)
+
+        # Verify sync_untracked_transcripts adds transcript_only turn and dedups on second run
+        old_mtime = time.time() - 180.0
+        os.utime(tp, (old_mtime, old_mtime))
+        res1 = self.agy_usage.sync_untracked_transcripts(
+            ledger_path=self.paths.LEDGER_PATH,
+            brain_dir=brain_tmp,
+            active_dir=self.paths.ACTIVE_DIR,
+            min_age_sec=90.0,
+        )
+        self.assertEqual(res1["addedTurns"], 1)
+        self.assertEqual(res1["addedSteps"], 2)
+        rows = self.agy_usage.load_entries(self.paths.LEDGER_PATH)
+        self.assertEqual(rows[0]["status"], "transcript_only")
+        res2 = self.agy_usage.sync_untracked_transcripts(
+            ledger_path=self.paths.LEDGER_PATH,
+            brain_dir=brain_tmp,
+            active_dir=self.paths.ACTIVE_DIR,
+            min_age_sec=90.0,
+        )
+        self.assertEqual(res2["addedTurns"], 0)
+
+    def test_windows_cp1252_safe_print_backfill(self):
+        import io
+
+        buf = io.BytesIO()
+        cp1252_stream = io.TextIOWrapper(buf, encoding="cp1252", errors="strict")
+        old_stdout = sys.stdout
+        sys.stdout = cp1252_stream
+        try:
+            self.agy_usage.run_backfill()
+            cp1252_stream.flush()
+        finally:
+            sys.stdout = old_stdout
+        self.assertTrue(len(buf.getvalue()) > 0)
 
 
 if __name__ == "__main__":

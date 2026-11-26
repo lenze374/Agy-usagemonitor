@@ -15,7 +15,13 @@ import os
 import shutil
 import statistics
 import sys
+import time
 from datetime import datetime, timedelta
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 SRC_DIR = os.path.dirname(os.path.realpath(__file__))
 if SRC_DIR not in sys.path:
@@ -24,13 +30,16 @@ if SRC_DIR not in sys.path:
 from common import (
     atomic_write_text,
     disp_width,
+    ensure_utf8_stdio,
     fetch_quota_best,
     pad_l,
     pad_r,
     parse_iso_epoch,
     parse_local_naive,
+    safe_print,
 )
 from paths import (
+    ACTIVE_DIR,
     BRAIN_DIR,
     CONFIG_PATH,
     HOOKS_JSON_PATH,
@@ -286,19 +295,19 @@ def get_hook_enabled(hooks_json_path=HOOKS_JSON_PATH):
 
 def set_hook_enabled(enable, hooks_json_path=HOOKS_JSON_PATH):
     if not os.path.exists(hooks_json_path):
-        print(f"配置文件不存在: {hooks_json_path}")
+        safe_print(f"配置文件不存在: {hooks_json_path}")
         return
     with open(hooks_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     if HOOK_KEY not in cfg:
-        print(f"未在 {hooks_json_path} 中找到 {HOOK_KEY}")
+        safe_print(f"未在 {hooks_json_path} 中找到 {HOOK_KEY}")
         return
     cfg[HOOK_KEY]["enabled"] = bool(enable)
     with open(hooks_json_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
         f.write("\n")
     state_str = "已启用 (ON)" if enable else "已暂停 (OFF)"
-    print(f"全局额度追踪 Hook 状态: {state_str}")
+    safe_print(f"全局额度追踪 Hook 状态: {state_str}")
 
 
 def print_live_quota():
@@ -335,7 +344,14 @@ def print_live_quota():
 def print_last_snapshot_banner(rows):
     if not rows:
         return
-    last = rows[-1]
+    last = None
+    for r in reversed(rows):
+        pools = r.get("pools") or {}
+        if any(isinstance(pools.get(k), dict) and pools[k].get("end") is not None for k in POOL_KEYS):
+            last = r
+            break
+    if last is None:
+        return
     end_str = (last.get("endIso") or "")[:19].replace("T", " ")
     pools = last.get("pools") or {}
     g5 = pools.get("gemini_5h") or {}
@@ -539,11 +555,353 @@ def enrich_turn_steps_from_transcript(transcript_path, existing_steps, step_star
     return changed, models_list, search_web_calls, error_steps, subagent_calls
 
 
-def run_backfill():
-    if not os.path.exists(LEDGER_PATH):
-        print("账本文件尚不存在，无需回填。")
-        return
+def _collect_recorded_index(rows):
+    recorded_steps = {}
+    recorded_windows = {}
+    conv_workspaces = {}
+    for r in rows or []:
+        cid = str(r.get("conversationId") or "").strip()
+        cuuid = str(r.get("conversationUuid") or "").strip()
+        keys = [k for k in (cuuid, cid, cid[:8] if cid else "", cuuid[:8] if cuuid else "") if k]
+        ws = str(r.get("workspace") or "").strip()
+        if ws and ws != "-":
+            for k in keys:
+                conv_workspaces.setdefault(k, ws)
 
+        tsteps = r.get("tokenSteps") or []
+        if tsteps:
+            for k in keys:
+                s_set = recorded_steps.setdefault(k, set())
+                for s in tsteps:
+                    if isinstance(s, dict) and s.get("step") is not None:
+                        try:
+                            s_set.add(int(s["step"]))
+                        except (TypeError, ValueError):
+                            pass
+        else:
+            s_ep = r.get("startTs") or parse_iso_epoch(r.get("startIso"))
+            e_ep = r.get("ts") or parse_iso_epoch(r.get("endIso"))
+            if s_ep is not None and e_ep is not None:
+                win = (float(s_ep) - 3.0, float(e_ep) + 3.0)
+                for k in keys:
+                    recorded_windows.setdefault(k, []).append(win)
+    return recorded_steps, recorded_windows, conv_workspaces
+
+
+def _build_synced_turn_entry(conv_uuid, group_items, workspace):
+    token_steps = []
+    step_epochs = []
+    search_web_calls = 0
+    error_steps = 0
+    subagent_calls = 0
+    last_model = ""
+    for item in group_items:
+        obj = item["obj"]
+        if str(obj.get("status") or "").upper() == "ERROR" or bool(obj.get("error")):
+            error_steps += 1
+        for tc in obj.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            tname = str(tc.get("name") or tc.get("tool") or "").strip().lower()
+            if tname == "search_web":
+                search_web_calls += 1
+            elif tname == "invoke_subagent":
+                subagent_calls += 1
+        if item["billed"]:
+            in_t = item["in"]
+            cr_t = item["cache"]
+            out_t = item["out"]
+            step_rec = {
+                "step": item["step"],
+                "at": str(obj.get("created_at") or ""),
+                "type": str(obj.get("type") or ""),
+                "in": in_t,
+                "cache": cr_t,
+                "out": out_t,
+            }
+            sm = str(obj.get("model") or "").strip()
+            if sm:
+                step_rec["model"] = sm
+                last_model = sm
+            token_steps.append(step_rec)
+            if item["ep"] is not None:
+                step_epochs.append(item["ep"])
+
+    if not token_steps or not step_epochs:
+        return None
+
+    token_steps.sort(key=lambda x: x["step"])
+    s_ep = min(step_epochs)
+    e_ep = max(step_epochs)
+    total_in = sum(s["in"] for s in token_steps)
+    total_cr = sum(s["cache"] for s in token_steps)
+    total_out = sum(s["out"] for s in token_steps)
+
+    return {
+        "ts": round(float(e_ep), 3),
+        "startTs": round(float(s_ep), 3),
+        "startIso": datetime.fromtimestamp(s_ep).astimezone().isoformat(timespec="seconds"),
+        "endIso": datetime.fromtimestamp(e_ep).astimezone().isoformat(timespec="seconds"),
+        "durationSec": round(max(0.0, e_ep - s_ep), 2),
+        "conversationId": conv_uuid[:8],
+        "conversationUuid": conv_uuid,
+        "workspace": workspace or "-",
+        "workspacePath": "",
+        "model": last_model or "auto",
+        "plan": "",
+        "invocations": len(token_steps),
+        "terminationReason": "TRANSCRIPT_SYNC",
+        "status": "transcript_only",
+        "source": "transcript_sync",
+        "tokens": {
+            "input": total_in,
+            "cacheRead": total_cr,
+            "output": total_out,
+            "total": total_in + total_cr + total_out,
+            "billedSteps": len(token_steps),
+            "compactions": sum(1 for s in token_steps if s["type"] == "CHECKPOINT"),
+            "stepStart": token_steps[0]["step"],
+            "stepEnd": token_steps[-1]["step"],
+            "models": sorted({s["model"] for s in token_steps if s.get("model")}),
+            "searchWebCalls": search_web_calls,
+            "errorSteps": error_steps,
+            "subagentCalls": subagent_calls,
+        },
+        "tokenSteps": token_steps,
+        "pools": {},
+    }
+
+
+def _collect_untracked_from_transcript(conv_uuid, tp, rec_steps, rec_wins, workspace):
+    parsed_by_step = {}
+    try:
+        with open(tp, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("step_index") is None:
+                    continue
+                try:
+                    step_idx = int(obj["step_index"])
+                except (TypeError, ValueError):
+                    continue
+                prev_it = parsed_by_step.get(step_idx)
+                in_t = int(obj.get("input_tokens") or 0)
+                cr_t = int(obj.get("cache_read_tokens") or 0)
+                out_t = int(obj.get("output_tokens") or 0)
+                billed = (in_t > 0 or cr_t > 0 or out_t > 0)
+                if prev_it is not None and (prev_it["billed"] or not billed):
+                    continue
+                ep = parse_iso_epoch(obj.get("created_at"))
+                parsed_by_step[step_idx] = {
+                    "step": step_idx,
+                    "ep": ep,
+                    "type": str(obj.get("type") or ""),
+                    "billed": billed,
+                    "in": in_t,
+                    "cache": cr_t,
+                    "out": out_t,
+                    "obj": obj,
+                }
+    except Exception:
+        return []
+
+    parsed = list(parsed_by_step.values())
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda x: x["step"])
+    user_epoch = 0
+    for it in parsed:
+        if it["type"] == "USER_INPUT":
+            user_epoch += 1
+        it["user_epoch"] = user_epoch
+
+    raw_groups = []
+    cur_group = []
+    prev_billed_epoch = None
+    prev_billed_ep = None
+    for it in parsed:
+        st_idx = it["step"]
+        ep = it["ep"]
+        if it["billed"]:
+            already_recorded = (st_idx in rec_steps) or (
+                ep is not None and any(ws <= ep <= we for ws, we in rec_wins)
+            )
+            if already_recorded:
+                if cur_group:
+                    raw_groups.append(cur_group)
+                    cur_group = []
+                prev_billed_epoch = None
+                prev_billed_ep = None
+                continue
+            gap_split = (
+                prev_billed_ep is not None
+                and ep is not None
+                and (ep - prev_billed_ep) > 120.0
+            )
+            user_split = (
+                prev_billed_epoch is not None and it["user_epoch"] != prev_billed_epoch
+            )
+            if cur_group and (gap_split or user_split):
+                raw_groups.append(cur_group)
+                cur_group = []
+            cur_group.append(it)
+            prev_billed_epoch = it["user_epoch"]
+            prev_billed_ep = ep
+        else:
+            if cur_group and it["user_epoch"] == prev_billed_epoch and (
+                ep is None or prev_billed_ep is None or (ep - prev_billed_ep) <= 120.0
+            ):
+                cur_group.append(it)
+    if cur_group:
+        raw_groups.append(cur_group)
+
+    entries = []
+    for grp in raw_groups:
+        ent = _build_synced_turn_entry(conv_uuid, grp, workspace)
+        if ent is not None:
+            entries.append(ent)
+    return entries
+
+
+def sync_untracked_transcripts(
+    ledger_path=LEDGER_PATH,
+    brain_dir=BRAIN_DIR,
+    active_dir=ACTIVE_DIR,
+    min_age_sec=90.0,
+    now_ts=None,
+):
+    """
+    Discover settled untracked turns (e.g., subagents, swarms, interrupted turns, Hook-OFF)
+    from `brain/<uuid>/.system_generated/logs/transcript.jsonl` and append deduplicated
+    `status="transcript_only"` rows to `ledger.jsonl`.
+    """
+    if not os.path.isdir(brain_dir):
+        return {"addedTurns": 0, "addedSteps": 0, "scannedFiles": 0}
+
+    cur_ts = float(now_ts) if now_ts is not None else time.time()
+    active_ids = set()
+    if active_dir and os.path.isdir(active_dir):
+        try:
+            for fname in os.listdir(active_dir):
+                if not fname.endswith(".json"):
+                    continue
+                stem = fname[:-5]
+                if stem:
+                    active_ids.add(stem)
+                    active_ids.add(stem[:8])
+                try:
+                    with open(os.path.join(active_dir, fname), "r", encoding="utf-8") as af:
+                        rec = json.load(af)
+                    cid = str(rec.get("conversationId") or "").strip()
+                    if cid:
+                        active_ids.add(cid)
+                        active_ids.add(cid[:8])
+                except Exception:
+                    continue
+        except OSError:
+            pass
+
+    existing_rows = load_entries(ledger_path)
+    rec_steps_map, rec_wins_map, ws_map = _collect_recorded_index(existing_rows)
+
+    candidate_entries = []
+    scanned_files = 0
+    try:
+        names = sorted(os.listdir(brain_dir))
+    except OSError:
+        return {"addedTurns": 0, "addedSteps": 0, "scannedFiles": 0}
+
+    for conv_uuid in names:
+        if conv_uuid in active_ids or conv_uuid[:8] in active_ids:
+            continue
+        tp = os.path.join(brain_dir, conv_uuid, ".system_generated", "logs", "transcript.jsonl")
+        if not os.path.isfile(tp):
+            continue
+        try:
+            if (cur_ts - os.path.getmtime(tp)) < float(min_age_sec):
+                continue
+        except OSError:
+            continue
+        scanned_files += 1
+        rec_steps = set()
+        rec_steps.update(rec_steps_map.get(conv_uuid, ()))
+        rec_steps.update(rec_steps_map.get(conv_uuid[:8], ()))
+        rec_wins = list(rec_wins_map.get(conv_uuid, ())) + list(rec_wins_map.get(conv_uuid[:8], ()))
+        ws = ws_map.get(conv_uuid) or ws_map.get(conv_uuid[:8]) or "-"
+        candidate_entries.extend(
+            _collect_untracked_from_transcript(conv_uuid, tp, rec_steps, rec_wins, ws)
+        )
+
+    if not candidate_entries:
+        return {"addedTurns": 0, "addedSteps": 0, "scannedFiles": scanned_files}
+
+    lock_path = ledger_path + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(ledger_path)), exist_ok=True)
+    lock_fd = None
+    try:
+        if fcntl is not None:
+            lock_fd = open(lock_path, "a+", encoding="utf-8")
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+
+        latest_rows = load_entries(ledger_path)
+        latest_steps_map, latest_wins_map, _ = _collect_recorded_index(latest_rows)
+        final_new = []
+        for ent in candidate_entries:
+            cuuid = ent["conversationUuid"]
+            cid = ent["conversationId"]
+            seen_s = set()
+            seen_s.update(latest_steps_map.get(cuuid, ()))
+            seen_s.update(latest_steps_map.get(cid, ()))
+            wins = list(latest_wins_map.get(cuuid, ())) + list(latest_wins_map.get(cid, ()))
+            ent_steps = [int(s["step"]) for s in (ent.get("tokenSteps") or [])]
+            if any(st in seen_s for st in ent_steps):
+                continue
+            mid_ep = ent["ts"]
+            if any(ws_a <= mid_ep <= ws_b for ws_a, ws_b in wins):
+                continue
+            final_new.append(ent)
+            for st in ent_steps:
+                latest_steps_map.setdefault(cuuid, set()).add(st)
+
+        if not final_new:
+            return {"addedTurns": 0, "addedSteps": 0, "scannedFiles": scanned_files}
+
+        if os.path.exists(ledger_path):
+            shutil.copy2(ledger_path, ledger_path + ".bak")
+
+        merged = latest_rows + final_new
+        merged.sort(
+            key=lambda r: (
+                float(r.get("ts") or parse_iso_epoch(r.get("endIso")) or 0.0),
+                float(r.get("startTs") or parse_iso_epoch(r.get("startIso")) or 0.0),
+            )
+        )
+        content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in merged)
+        atomic_write_text(ledger_path, content)
+        added_steps = sum(int((r.get("tokens") or {}).get("billedSteps") or 0) for r in final_new)
+        return {
+            "addedTurns": len(final_new),
+            "addedSteps": added_steps,
+            "scannedFiles": scanned_files,
+        }
+    finally:
+        if lock_fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
+
+
+def run_backfill():
     brain_map = {}
     uuid_path_map = {}
     if os.path.isdir(BRAIN_DIR):
@@ -619,20 +977,31 @@ def run_backfill():
         else:
             unmatched += 1
 
-    if updated == 0 and enriched == 0:
-        print(f"回填检查完成：已有 Token 明细 {already} 条，新增回填 0 条，补充标记 0 条（未匹配 {unmatched} 条）。")
+    if updated > 0 or enriched > 0:
+        if os.path.exists(LEDGER_PATH):
+            shutil.copy2(LEDGER_PATH, LEDGER_PATH + ".bak")
+        content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+        atomic_write_text(LEDGER_PATH, content)
+
+    sync_res = sync_untracked_transcripts(
+        ledger_path=LEDGER_PATH,
+        brain_dir=BRAIN_DIR,
+        active_dir=ACTIVE_DIR,
+    )
+    added_turns = sync_res["addedTurns"]
+    added_steps = sync_res["addedSteps"]
+
+    if updated == 0 and enriched == 0 and added_turns == 0:
+        safe_print(
+            f"回填检查完成：已有 Token 明细 {already} 条，新增回填 0 条，补充标记 0 条，"
+            f"未入账补录 0 条（未匹配 {unmatched} 条）。"
+        )
         return
 
-    bak_path = LEDGER_PATH + ".bak"
-    shutil.copy2(LEDGER_PATH, bak_path)
-    tmp_path = LEDGER_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(tmp_path, LEDGER_PATH)
-    print(
-        f"历史回填成功：新增回填 {updated} 条，补充逐 step 模型与工具标记 {enriched} 条，原有 {already} 条，未匹配 {unmatched} 条。\n"
-        f"（原账本已自动备份至 {bak_path}）"
+    safe_print(
+        f"历史回填成功：补齐旧记录 {updated} 条，补充逐 step 模型与工具标记 {enriched} 条，"
+        f"补录遗漏对话 {added_turns} 轮（{added_steps} 步），原有 {already} 条，未匹配 {unmatched} 条。\n"
+        f"（原账本已自动备份至 {LEDGER_PATH}.bak）"
     )
 
 
@@ -1624,6 +1993,9 @@ def compute_display_item_metrics(item, overlapping, weekly_rates, five_h_to_week
         if st == "long_gap":
             obs_str = "  跨休眠  "
             flags.append("跨休眠剔除")
+        elif st == "transcript_only":
+            obs_str = " 仅Token  "
+            flags.append("转录补录")
         else:
             obs_val, obs_kind = turn_measured_weekly_delta(r, five_h_to_weekly=five_h_to_weekly)
             if obs_kind == "false_reset":
@@ -1749,33 +2121,384 @@ def print_step_details(rows, n_turns):
 
 def detect_quota_week_start(rows, fallback_dt, monitor_rows=None, pool_key="gemini_weekly"):
     mon_key = "gw" if pool_key == "gemini_weekly" else "cw"
-    best_row_ts = -1.0
-    best_reset_dt = None
 
+    if monitor_rows:
+        import agy_monitor
+
+        clean_rows = agy_monitor.clean_monitor_timeline(monitor_rows)
+        if clean_rows:
+            last_win_reset_idx = -1
+            last_win_reset_dt = None
+            for i, c in enumerate(clean_rows):
+                if (c.get("window_resets") or {}).get(mon_key):
+                    last_win_reset_idx = i
+                    last_win_reset_dt = parse_local_naive(c.get("iso"))
+
+            search_slice = clean_rows[last_win_reset_idx:] if last_win_reset_idx >= 0 else clean_rows
+            for c in reversed(search_slice):
+                res_s = (c.get("resets") or {}).get(mon_key)
+                reset_dt = parse_local_naive(res_s)
+                if reset_dt is not None:
+                    return reset_dt - timedelta(days=7)
+
+            if last_win_reset_dt is not None:
+                return last_win_reset_dt
+
+    best_reset_dt = None
     for r in reversed(rows or []):
         pw = (r.get("pools") or {}).get(pool_key) or {}
         reset_dt = parse_local_naive(pw.get("resetsAt"))
         if reset_dt is not None:
-            r_ts = float(r.get("ts") or parse_iso_epoch(r.get("endIso")) or 0.0)
-            best_row_ts = r_ts
             best_reset_dt = reset_dt
             break
-
-    if monitor_rows:
-        for r in reversed(monitor_rows):
-            if not r.get("ok"):
-                continue
-            res_s = (r.get("resets") or {}).get(mon_key)
-            reset_dt = parse_local_naive(res_s)
-            if reset_dt is not None:
-                m_ts = float(r.get("ts") or parse_iso_epoch(r.get("iso")) or 0.0)
-                if best_reset_dt is None or m_ts >= best_row_ts or reset_dt > best_reset_dt:
-                    best_reset_dt = reset_dt
-                break
 
     if best_reset_dt is not None:
         return best_reset_dt - timedelta(days=7)
     return fallback_dt
+
+
+def apply_local_token_correction(
+    clean_rows,
+    ledger_rows,
+    weekly_rates,
+    five_h_to_weekly=FIVE_H_TO_WEEKLY,
+    rate_preset="none",
+):
+    """
+    Post-usage local-token correction over a denoised monitor timeline (`clean_rows`):
+      - Rule B: Strips un-settled Gemini pre-reservations at the live tail using
+        `inv = gw - ratio * g5` bounded below by `gw_before + local_tokens_since`
+        (skipped automatically on weekly-only accounts without a 5h pool).
+      - Rule A: When completed local turns show `localEst > monActive`, re-attributes
+        preceding/interleaved `idle_on` pre-reservation spikes (`<= 600s` or inside the same
+        un-settled `inv` plateau) back to `dgw_active`.
+    Returns `(corrected_rows, {"tokenCorrectedGw": ..., "pendingPreReservationGw": ...})`.
+    """
+    if not clean_rows:
+        return [], {"tokenCorrectedGw": 0.0, "pendingPreReservationGw": 0.0}
+
+    ratio = float(five_h_to_weekly or FIVE_H_TO_WEEKLY)
+    pre_unit = max(0.05, 1.0 - ratio)
+
+    out = []
+    for c in clean_rows:
+        nc = dict(c)
+        nc["pool_gaps"] = dict(c.get("pool_gaps") or {})
+        nc["window_resets"] = dict(c.get("window_resets") or {})
+        nc["reset_flags"] = dict(c.get("reset_flags") or {})
+        dgw = float(nc.get("dgw") or 0.0)
+        is_off = bool((nc["pool_gaps"].get("gw") or 0.0) > 300.0 and nc.get("idle"))
+        nc["dgw_offline"] = dgw if (dgw > 0.0 and is_off) else 0.0
+        nc["dgw_idle_on"] = dgw if (dgw > 0.0 and nc.get("idle") and not is_off) else 0.0
+        nc["dgw_active"] = dgw if (dgw > 0.0 and not nc.get("idle")) else 0.0
+        nc["token_corrected_gw"] = 0.0
+        nc["pending_preres_gw"] = 0.0
+        out.append(nc)
+
+    def _recompute_dgw_from(start_idx):
+        for k in range(start_idx, len(out)):
+            ck = out[k]
+            if k == 0:
+                dg = 0.0
+            elif ck["window_resets"].get("gw"):
+                dg = round(max(0.0, float(ck.get("gw") or 0.0)), 6)
+            else:
+                dg = round(max(0.0, float(ck.get("gw") or 0.0) - float(out[k - 1].get("gw") or 0.0)), 6)
+            ck["dgw"] = dg
+            is_off_k = bool((ck["pool_gaps"].get("gw") or 0.0) > 300.0 and ck.get("idle"))
+            ck["dgw_offline"] = dg if (dg > 0.0 and is_off_k) else 0.0
+            ck["dgw_idle_on"] = dg if (dg > 0.0 and ck.get("idle") and not is_off_k) else 0.0
+            ck["dgw_active"] = dg if (dg > 0.0 and not ck.get("idle")) else 0.0
+
+    # --- Rule B: Live tail un-settled Gemini pre-reservation correction ---
+    seg_start = len(out) - 1
+    while seg_start > 0:
+        wr = out[seg_start]["window_resets"]
+        if wr.get("g5") or wr.get("gw"):
+            break
+        seg_start -= 1
+    seg = out[seg_start:]
+    has_5h_pool = any(
+        float(c.get("raw_g5") or 0.0) > 1e-6 or bool((c.get("resets") or {}).get("g5"))
+        for c in seg
+    )
+    if len(seg) >= 2 and has_5h_pool and ratio < 0.90:
+        invs = [float(c["raw_gw"]) - ratio * float(c["raw_g5"]) for c in seg]
+        inv_base = min(invs[:-1])
+        ex_tail = invs[-1] - inv_base
+        if ex_tail >= 0.45:
+            p_start_inv = None
+            for k in range(1, len(seg)):
+                if all((invs[m] - inv_base) >= 0.45 for m in range(k, len(seg))):
+                    p_start_inv = k
+                    break
+            p_start_open = next(
+                (k for k in range(1, len(seg)) if float(seg[k].get("unmatched_preres_open_gw") or 0.0) > 0.05),
+                None,
+            )
+            cands_p = [k for k in (p_start_inv, p_start_open) if k is not None]
+            p_start = min(cands_p) if cands_p else None
+            if p_start is not None:
+                open_sum = sum(
+                    float(c.get("unmatched_preres_open_gw") or 0.0)
+                    for c in seg[p_start:]
+                )
+                ref_sum = sum(
+                    float(c.get("unmatched_preres_refund_gw") or 0.0)
+                    for c in seg[p_start:]
+                )
+                net_open_pre_w = max(0.0, open_sum - ref_sum)
+                if abs((ex_tail / ratio) - round(ex_tail / ratio)) <= 0.14:
+                    ex_max = max(invs[p_start:]) - inv_base
+                    q_cap = max(1, int(round(ex_tail + 0.50)))
+                    q_legacy = float(max(1, min(q_cap, int(round(ex_max / pre_unit)))))
+                else:
+                    q_legacy = 0.0
+                pre_strip = (
+                    max(q_legacy, net_open_pre_w)
+                    if (q_legacy > 0.0 or net_open_pre_w > 0.45)
+                    else 0.0
+                )
+                gw_before = float(seg[p_start - 1]["gw"])
+                t_pre = float(seg[p_start - 1]["ts"])
+                if (
+                    pre_strip > 0.05
+                    and float(seg[-1]["gw"]) > gw_before + 0.05
+                    and (
+                        q_legacy <= 0.0
+                        or (
+                            float(seg[-1]["raw_gw"]) >= q_legacy - 0.02
+                            and float(seg[-1]["gw"]) - q_legacy >= gw_before - 0.05
+                        )
+                    )
+                ):
+                    local_since = sum(
+                        float(row_theoretical_weekly(r, weekly_rates, rate_preset=rate_preset) or 0.0)
+                        for r in (ledger_rows or [])
+                        if r.get("status") != "long_gap"
+                        and not is_third_party_model(r.get("model"))
+                        and float(r.get("ts") or parse_iso_epoch(r.get("endIso")) or 0.0) > t_pre
+                    )
+                    stripped_tail = max(gw_before, float(seg[-1]["gw"]) - pre_strip)
+                    tail_corrected = min(
+                        float(seg[-1]["gw"]),
+                        max(gw_before + local_since, stripped_tail),
+                    )
+                    prev_c = gw_before
+                    cum_open = 0.0
+                    cum_ref = 0.0
+                    for k in range(p_start, len(seg)):
+                        if open_sum > 0.05:
+                            cum_open += float(seg[k].get("unmatched_preres_open_gw") or 0.0)
+                            cum_ref += float(seg[k].get("unmatched_preres_refund_gw") or 0.0)
+                            strip_k = min(pre_strip, max(0.0, cum_open - cum_ref))
+                            if k == len(seg) - 1 and strip_k == 0.0:
+                                strip_k = pre_strip
+                        else:
+                            strip_k = pre_strip
+                        stripped_k = max(gw_before, float(seg[k]["gw"]) - strip_k)
+                        if k == len(seg) - 1:
+                            cv = tail_corrected
+                        else:
+                            cv = max(prev_c, min(stripped_k, tail_corrected))
+                        pending = max(0.0, float(seg[k]["gw"]) - cv)
+                        seg[k]["pending_preres_gw"] = round(pending, 4)
+                        seg[k]["gw"] = round(cv, 6)
+                        prev_c = cv
+                    _recompute_dgw_from(seg_start + p_start)
+        elif 0.08 <= ex_tail < 0.45:
+            p_start = None
+            for k in range(1, len(seg)):
+                if all((invs[m] - inv_base) >= 0.08 for m in range(k, len(seg))):
+                    p_start = k
+                    break
+            if p_start is not None:
+                open_sum = sum(
+                    float(c.get("unmatched_preres_open_gw") or 0.0)
+                    for c in seg[p_start:]
+                )
+                ref_sum = sum(
+                    float(c.get("unmatched_preres_refund_gw") or 0.0)
+                    for c in seg[p_start:]
+                )
+                net_open_pre_w = max(0.0, open_sum - ref_sum)
+                gw_before = float(seg[p_start - 1]["gw"])
+                t_pre = float(seg[p_start - 1]["ts"])
+                local_since = sum(
+                    float(row_theoretical_weekly(r, weekly_rates, rate_preset=rate_preset) or 0.0)
+                    for r in (ledger_rows or [])
+                    if r.get("status") != "long_gap"
+                    and not is_third_party_model(r.get("model"))
+                    and float(r.get("ts") or parse_iso_epoch(r.get("endIso")) or 0.0) > t_pre
+                )
+                if (
+                    local_since > 0.005
+                    and (int(seg[-1].get("localActive") or 0) == 0 or local_since > 0.01)
+                    and float(seg[-1]["gw"]) > gw_before + local_since + 0.05
+                ):
+                    max_pre = max(min(0.95, ex_tail / pre_unit), net_open_pre_w)
+                    stripped_tail = max(gw_before, float(seg[-1]["gw"]) - max_pre)
+                    tail_corrected = min(
+                        float(seg[-1]["gw"]),
+                        max(gw_before + local_since, stripped_tail),
+                    )
+                    if tail_corrected < float(seg[-1]["gw"]) - 0.01:
+                        prev_c = gw_before
+                        cum_open = 0.0
+                        cum_ref = 0.0
+                        for k in range(p_start, len(seg)):
+                            if open_sum > 0.05:
+                                cum_open += float(seg[k].get("unmatched_preres_open_gw") or 0.0)
+                                cum_ref += float(seg[k].get("unmatched_preres_refund_gw") or 0.0)
+                                strip_k = min(max_pre, max(0.0, cum_open - cum_ref))
+                                if k == len(seg) - 1 and strip_k == 0.0:
+                                    strip_k = max_pre
+                                target_k = min(
+                                    tail_corrected,
+                                    max(gw_before, float(seg[k]["gw"]) - strip_k),
+                                )
+                            else:
+                                target_k = min(float(seg[k]["gw"]), tail_corrected)
+                            if k == len(seg) - 1:
+                                cv = tail_corrected
+                            else:
+                                cv = max(prev_c, target_k)
+                            seg[k]["pending_preres_gw"] = round(max(0.0, float(seg[k]["gw"]) - cv), 4)
+                            seg[k]["gw"] = round(cv, 6)
+                            prev_c = cv
+                        _recompute_dgw_from(seg_start + p_start)
+
+    # --- Rule A: Post-session local-token deficit attribution correction ---
+    preres_spans = []
+    segs_bounds = []
+    s0 = 0
+    for i in range(1, len(out)):
+        wr = out[i]["window_resets"]
+        if wr.get("g5") or wr.get("gw"):
+            segs_bounds.append((s0, i))
+            s0 = i
+    segs_bounds.append((s0, len(out)))
+
+    for a, b in segs_bounds:
+        if (b - a) < 3:
+            continue
+        invs = [float(out[k]["raw_gw"]) - ratio * float(out[k]["raw_g5"]) for k in range(a, b)]
+        inv_smin = [0.0] * len(invs)
+        m_val = invs[-1]
+        for k in range(len(invs) - 1, -1, -1):
+            if invs[k] < m_val:
+                m_val = invs[k]
+            inv_smin[k] = m_val
+        span_start = None
+        for k, ex in enumerate(invs[m] - inv_smin[m] for m in range(len(invs))):
+            if ex > 0.20:
+                if span_start is None:
+                    span_start = float(out[a + k]["ts"])
+            else:
+                if span_start is not None:
+                    preres_spans.append((span_start, float(out[a + k]["ts"])))
+                    span_start = None
+        if span_start is not None:
+            preres_spans.append((span_start, float(out[b - 1]["ts"])))
+
+    def _span_of(ts_val):
+        for si, (sa, sb) in enumerate(preres_spans):
+            if sa <= ts_val <= sb:
+                return si
+        return None
+
+    gem_turns = []
+    for r in ledger_rows or []:
+        if r.get("status") == "long_gap" or is_third_party_model(r.get("model")):
+            continue
+        s_ep = float(r.get("startTs") or parse_iso_epoch(r.get("startIso")) or 0.0)
+        e_ep = float(r.get("ts") or parse_iso_epoch(r.get("endIso")) or s_ep)
+        est = row_theoretical_weekly(r, weekly_rates, rate_preset=rate_preset)
+        if e_ep > 0.0 and est is not None and est > 0.0:
+            gem_turns.append((s_ep, e_ep, float(est)))
+    gem_turns.sort()
+
+    sessions = []
+    for s_ep, e_ep, est in gem_turns:
+        if not sessions:
+            sessions.append({"start": s_ep, "end": e_ep, "local": est})
+            continue
+        sp_prev = _span_of(sessions[-1]["end"])
+        sp_cur = _span_of(s_ep)
+        same_span = (sp_prev is not None and sp_prev == sp_cur)
+        if (s_ep - sessions[-1]["end"]) <= 1200.0 or same_span:
+            sessions[-1]["end"] = max(sessions[-1]["end"], e_ep)
+            sessions[-1]["local"] += est
+        else:
+            sessions.append({"start": s_ep, "end": e_ep, "local": est})
+
+    for sess in sessions:
+        mon_act = sum(
+            c["dgw_active"]
+            for c in out
+            if (sess["start"] - 60.0) <= c["ts"] <= (sess["end"] + 180.0)
+        )
+        deficit = sess["local"] - mon_act
+        if deficit <= 0.005:
+            continue
+        sp_sess = _span_of(sess["start"])
+        span_a = preres_spans[sp_sess][0] if sp_sess is not None else None
+
+        cands = []
+        for idx, c in enumerate(out):
+            if c["dgw_idle_on"] <= 1e-4:
+                continue
+            dt_before = sess["start"] - c["ts"]
+            in_pre = 0.0 <= dt_before <= 600.0
+            in_mid = sess["start"] < c["ts"] <= (sess["end"] + 60.0)
+            is_1to1 = (
+                0.95 <= c["dgw_idle_on"] <= 1.08
+                and 0.95 <= float(c.get("dg5") or 0.0) <= 1.08
+            )
+            is_partial_preres = (
+                float(c.get("dg5") or 0.0) >= 0.90
+                and c["dgw_idle_on"] >= 0.10
+                and (c["dgw_idle_on"] - ratio * float(c.get("dg5") or 0.0)) > 0.01
+            )
+            in_span_open = bool(
+                span_a is not None
+                and span_a <= c["ts"] <= sess["start"]
+                and (is_1to1 or is_partial_preres)
+            )
+            in_paired_pre = bool(
+                0.0 <= dt_before <= 1800.0
+                and (
+                    c.get("preres_paired")
+                    or abs(float(c["raw_gw"]) - float(c["gw"])) > 0.02
+                )
+            )
+            if not (in_pre or in_mid or in_span_open or in_paired_pre):
+                continue
+            is_preres_or_clamped = (
+                is_1to1
+                or is_partial_preres
+                or bool(c.get("preres_paired"))
+                or abs(float(c["raw_gw"]) - float(c["gw"])) > 0.02
+            )
+            cands.append((0 if is_preres_or_clamped else 1, abs(dt_before), idx))
+
+        cands.sort()
+        for _, _, idx in cands:
+            if deficit <= 1e-4:
+                break
+            c = out[idx]
+            shift = min(deficit, c["dgw_idle_on"])
+            c["dgw_idle_on"] = round(max(0.0, c["dgw_idle_on"] - shift), 6)
+            c["dgw_active"] = round(c["dgw_active"] + shift, 6)
+            c["token_corrected_gw"] = round(c["token_corrected_gw"] + shift, 6)
+            deficit -= shift
+
+    sum_corr = sum(c["token_corrected_gw"] for c in out)
+    tail_pending = float(out[-1]["pending_preres_gw"]) if out else 0.0
+    return out, {
+        "tokenCorrectedGw": round(sum_corr, 4),
+        "pendingPreReservationGw": round(tail_pending, 4),
+    }
 
 
 def reconcile_shared_pools(
@@ -1799,12 +2522,31 @@ def reconcile_shared_pools(
     s_ts = since_dt.timestamp()
     u_ts = until_dt.timestamp() if until_dt is not None else None
     if mon_summary is None:
-        mon_summary = agy_monitor.summarize_monitor_rows(
-            monitor_rows or [],
-            all_rows=monitor_rows or [],
-            since_ts=s_ts,
-            until_ts=u_ts,
-        )
+        if monitor_rows:
+            clean_all = agy_monitor.clean_monitor_timeline(
+                monitor_rows, five_h_to_weekly=five_h_to_weekly
+            )
+            corrected_all, _corr_meta = apply_local_token_correction(
+                clean_all,
+                ledger_rows or [],
+                weekly_rates or {},
+                five_h_to_weekly=five_h_to_weekly,
+                rate_preset=rate_preset,
+            )
+            mon_summary = agy_monitor.summarize_clean_rows(
+                monitor_rows,
+                corrected_all,
+                since_ts=s_ts,
+                until_ts=u_ts,
+            )
+        else:
+            mon_summary = agy_monitor.summarize_monitor_rows(
+                [],
+                all_rows=[],
+                since_ts=s_ts,
+                until_ts=u_ts,
+                five_h_to_weekly=five_h_to_weekly,
+            )
 
     period_sum = summarize_period(
         ledger_rows or [],
@@ -1832,18 +2574,22 @@ def reconcile_shared_pools(
         mon_idle_on = float(mon_summary.get(f"online_idle_{mon_key}_up") or 0.0)
         mon_offline = float(mon_summary.get(f"offline_{mon_key}_up") or 0.0)
 
-        ext_concurrent = max(0.0, mon_active - local_est)
         ext_total = max(0.0, pool_total - local_est)
+        ext_offline = min(ext_total, mon_offline)
+        rem_ext = max(0.0, ext_total - ext_offline)
+        ext_idle_on = min(rem_ext, mon_idle_on)
+        ext_concurrent = max(0.0, rem_ext - ext_idle_on)
+
         denom = pool_total if pool_total > 1e-6 else local_est
         local_share = (100.0 * min(local_est, denom) / denom) if denom > 1e-6 else 0.0
         ext_share = (100.0 * ext_total / denom) if denom > 1e-6 else 0.0
 
-        return {
+        res = {
             "poolTotal": round(pool_total, 4),
             "localEst": round(local_est, 4),
             "monActive": round(mon_active, 4),
-            "monIdleOnline": round(mon_idle_on, 4),
-            "monOffline": round(mon_offline, 4),
+            "monIdleOnline": round(ext_idle_on, 4),
+            "monOffline": round(ext_offline, 4),
             "externalConcurrent": round(ext_concurrent, 4),
             "externalTotal": round(ext_total, 4),
             "localSharePct": round(local_share, 1),
@@ -1851,6 +2597,10 @@ def reconcile_shared_pools(
             "startClean": round(float((mon_summary.get("start_clean") or {}).get(mon_key) or 0.0), 4),
             "endClean": round(float((mon_summary.get("end_clean") or {}).get(mon_key) or 0.0), 4),
         }
+        if mon_key == "gw":
+            res["tokenCorrectedGw"] = round(float(mon_summary.get("token_corrected_gw") or 0.0), 4)
+            res["pendingPreReservation"] = round(float(mon_summary.get("pending_preres_gw") or 0.0), 4)
+        return res
 
     return {
         "sinceIso": since_dt.strftime("%Y-%m-%d %H:%M"),
@@ -1885,6 +2635,14 @@ def print_shared_pool_reconciliation(rec_gem, rec_cg):
             f"{pad_l(est_s, 10)} | {pad_l(ext_s, 10)} | "
             f"{pad_l(bd, 26)} | {pad_l(share_s, 8)}"
         )
+    gem = rec_gem.get("gemini") or {}
+    notes = []
+    if float(gem.get("tokenCorrectedGw") or 0.0) > 0.01:
+        notes.append(f"已按本机 Token 修正预扣错位 {gem['tokenCorrectedGw']:.2f}%")
+    if float(gem.get("pendingPreReservation") or 0.0) > 0.05:
+        notes.append(f"当前尾部含未结算预扣约 {gem['pendingPreReservation']:.2f}%（已按 Token 暂扣除）")
+    if notes:
+        print("* 对账修正：" + "；".join(notes) + "。")
 
 
 def print_footer_hint():
@@ -1943,6 +2701,7 @@ def build_arg_parser():
 
 
 def main():
+    ensure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args()
 

@@ -6,6 +6,7 @@ import ctypes
 import json
 import os
 import re
+import sys
 import time
 import unicodedata
 import urllib.request
@@ -382,3 +383,34 @@ def atomic_write_text(path, content):
         except OSError:
             pass
         raise
+
+
+def ensure_utf8_stdio():
+    """Reconfigure stdout/stderr to UTF-8 with replacement on narrow consoles (e.g., Windows cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def safe_print(*args, **kwargs):
+    """Print cleanly even on narrow console encodings (such as Windows cp1252) without raising."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        flush = bool(kwargs.get("flush", False))
+        stream = kwargs.get("file") or sys.stdout
+        if sep is None:
+            sep = " "
+        if end is None:
+            end = "\n"
+        text = sep.join(str(a) for a in args) + end
+        enc = getattr(stream, "encoding", None) or "utf-8"
+        safe_text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+        stream.write(safe_text)
+        if flush:
+            stream.flush()

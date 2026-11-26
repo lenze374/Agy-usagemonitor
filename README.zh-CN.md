@@ -10,8 +10,8 @@
 
 ## 核心特性
 
-- **共享池闭环分账（本机 vs 外部）**：结合对话级 Hook（`PreInvocation` / `Stop` + `transcript.jsonl`）与 Sidecar 每分钟本地 Language Server RPC 采样（`RetrieveUserQuotaSummary`），准确拆出 **我用的**、**别人用的(电脑开着时)**、**与你同时用(并发超额)** 以及 **电脑休眠期间**。
-- **两阶段水位去噪器**：自动剔除服务端 `resetsAt` 倒退旧副本读数、修复 1–2 分钟孤立下探，并通过窗口内后缀最小值擦除服务端预扣脉冲/回退噪点，同时不丢失真实睡眠跨天增量。
+- **共享池闭环分账（本机 vs 外部）**：结合对话级 Hook（`PreInvocation` / `Stop` + `transcript.jsonl`，并自动后台补录遗漏的子代理或中断轮次）、Sidecar 每分钟本地 Language Server RPC 采样（`RetrieveUserQuotaSummary`）与使用后本地 Token 修正（`Rule A/B`），准确拆出 **我用的**、**别人用的(电脑开着时)**、**与你同时用(并发超额)** 以及 **电脑休眠期间**。
+- **多阶段水位去噪器**：自动剔除服务端 `resetsAt` 倒退与空时间戳旧副本反弹、修复 1–2 分钟孤立下探，并通过 **Pass 1.5** 不变量配对（`inv = gw - ratio * g5`）、**Pass 2** 后缀最小值与 **Pass 3** 活跃感知锚点对齐，准确擦除服务端预扣回退并剥离实时尾部未结算预扣。
 - **安静窗口黄金样本 + 混合轮自动校准**：按 `In:Cache:Out = 1 : 0.05 : 5` 自动校准各模型每 `1M` 等效输入所耗周额度%，Pass-1 自动排除含 `search_web`/报错的轮次，Pass-2 从干净混合轮中反解未校准模型单价，并支持无损 `--backfill` 补录历史逐 step 模型标记。
 - **多订阅 & 多配额档位兼容**：
   - 动态渲染宿主返回的全部配额桶（含 `Gemini 5h/Weekly`、`Argon Weekly`、`Claude/GPT 5h/Weekly` 及未来新增桶）。
