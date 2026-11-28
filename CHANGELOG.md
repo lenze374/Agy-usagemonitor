@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.1 (2026-11-28)
+
+### Fixed
+- **Sidecar `BRAIN_DIR` & `AGY_DATA_ROOT` Resolution (`src/paths.py`)**:
+  - Antigravity Sidecar hosts pass both `ANTIGRAVITY_EXECUTABLE_DATA_DIR` (pointing to a per-sidecar private `data/` folder without `brain/`) and `ANTIGRAVITY_APP_DATA_DIR` (pointing to the shared root containing `brain/`). Previously `paths.py` read `ANTIGRAVITY_EXECUTABLE_DATA_DIR` first, causing `idleSec`/`localActive` tracking to record `null`/`0` and silently disabling the `600s` background transcript sync. Added `_infer_agy_data_root()` to prioritize `ANTIGRAVITY_APP_DATA_DIR` and verify a `brain/` subdirectory exists before selecting an environment root.
+- **Timeline Denoiser Deduplication & Stat-Keyed Cache (`src/dashboard_data.py`, `src/agy_usage.py`)**:
+  - Eliminated 6× redundant `clean_monitor_timeline()` calls per dashboard refresh and CLI run by reusing pre-cleaned timelines (`clean_rows`) across `estimate_five_h_ratio()`, `calibrate_weekly_model_rates()`, `detect_quota_week_start()`, and `reconcile_shared_pools()`.
+  - Added thread-safe file-stat-keyed caching (`_load_monitor_rows_cached()`, `_clean_monitor_timeline_cached()`, `_apply_token_corr_cached()`) in `dashboard_data.py`, drastically reducing Sidecar CPU usage during periodic polling.
+
 ## v0.2.0 (2026-11-26)
 
 ### Improved & Fixed

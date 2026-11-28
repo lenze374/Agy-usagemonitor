@@ -9,6 +9,7 @@ Zero automatic disk report exports; zero external dependencies.
 import io
 import os
 import sys
+import threading
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 
@@ -30,6 +31,89 @@ DEFAULT_POOL_LABELS = {
     "claude_gpt_5h": "Claude/GPT 5h",
     "claude_gpt_weekly": "Claude/GPT Weekly",
 }
+
+_DATA_CACHE_LOCK = threading.Lock()
+_MON_ROWS_CACHE = {"key": None, "rows": None}
+_CLEAN_TL_CACHE = {"key": None, "rows": None}
+_CORR_TL_CACHE = {"key": None, "result": None}
+
+
+def _clear_caches():
+    with _DATA_CACHE_LOCK:
+        _MON_ROWS_CACHE["key"] = None
+        _MON_ROWS_CACHE["rows"] = None
+        _CLEAN_TL_CACHE["key"] = None
+        _CLEAN_TL_CACHE["rows"] = None
+        _CORR_TL_CACHE["key"] = None
+        _CORR_TL_CACHE["result"] = None
+
+
+def _file_stat_key(path):
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+        return (real, st.st_mtime_ns, st.st_size, getattr(st, "st_ino", 0))
+    except OSError:
+        return None
+
+
+def _load_monitor_rows_cached(monitor_log):
+    key = _file_stat_key(monitor_log)
+    if key is not None:
+        with _DATA_CACHE_LOCK:
+            if _MON_ROWS_CACHE["key"] == key and _MON_ROWS_CACHE["rows"] is not None:
+                return _MON_ROWS_CACHE["rows"]
+    rows = agy_monitor.load_monitor_rows(monitor_log)
+    if key is not None:
+        with _DATA_CACHE_LOCK:
+            _MON_ROWS_CACHE["key"] = key
+            _MON_ROWS_CACHE["rows"] = rows
+    return rows
+
+
+def _clean_monitor_timeline_cached(monitor_log, mon_all, five_h_to_weekly=0.25):
+    if not mon_all:
+        return []
+    stat_key = _file_stat_key(monitor_log)
+    cache_key = (stat_key, round(float(five_h_to_weekly), 6)) if stat_key is not None else None
+    if cache_key is not None:
+        with _DATA_CACHE_LOCK:
+            if _CLEAN_TL_CACHE["key"] == cache_key and _CLEAN_TL_CACHE["rows"] is not None:
+                return _CLEAN_TL_CACHE["rows"]
+    cleaned = agy_monitor.clean_monitor_timeline(mon_all, five_h_to_weekly=five_h_to_weekly)
+    if cache_key is not None:
+        with _DATA_CACHE_LOCK:
+            _CLEAN_TL_CACHE["key"] = cache_key
+            _CLEAN_TL_CACHE["rows"] = cleaned
+    return cleaned
+
+
+def _apply_token_corr_cached(
+    mon_key, ledger_key, raw_clean_all, ledger_rows, weekly_rates, five_h_to_weekly, rate_preset
+):
+    if not raw_clean_all:
+        return [], {"tokenCorrectedGw": 0.0, "pendingPreReservationGw": 0.0}
+    cache_key = (
+        (mon_key, ledger_key, round(float(five_h_to_weekly), 6), str(rate_preset or "none"))
+        if (mon_key is not None and ledger_key is not None)
+        else None
+    )
+    if cache_key is not None:
+        with _DATA_CACHE_LOCK:
+            if _CORR_TL_CACHE["key"] == cache_key and _CORR_TL_CACHE["result"] is not None:
+                return _CORR_TL_CACHE["result"]
+    res = agy_usage.apply_local_token_correction(
+        raw_clean_all,
+        ledger_rows,
+        weekly_rates,
+        five_h_to_weekly=five_h_to_weekly,
+        rate_preset=rate_preset,
+    )
+    if cache_key is not None:
+        with _DATA_CACHE_LOCK:
+            _CORR_TL_CACHE["key"] = cache_key
+            _CORR_TL_CACHE["result"] = res
+    return res
 
 
 def _fmt_reset_short(iso_str):
@@ -644,30 +728,33 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
     if live:
         live_snap, live_ms = fetch_quota_best(timeout_sec=5.0)
 
-    mon_all = agy_monitor.load_monitor_rows(MONITOR_LOG)
+    mon_stat_key = _file_stat_key(MONITOR_LOG)
+    ledger_stat_key = _file_stat_key(LEDGER_PATH)
+    mon_all = _load_monitor_rows_cached(MONITOR_LOG)
+    base_clean = _clean_monitor_timeline_cached(MONITOR_LOG, mon_all, five_h_to_weekly=0.25)
     ledger_rows = agy_usage.load_entries(LEDGER_PATH)
     weekly_rates = {}
     model_samples = {}
     days7_start = now - timedelta(days=7)
     quota_wk_start = agy_usage.detect_quota_week_start(
-        ledger_rows, days7_start, monitor_rows=mon_all, pool_key="gemini_weekly"
+        ledger_rows, days7_start, monitor_rows=mon_all, pool_key="gemini_weekly", clean_rows=base_clean
     )
     cg_wk_start = agy_usage.detect_quota_week_start(
-        ledger_rows, days7_start, monitor_rows=mon_all, pool_key="claude_gpt_weekly"
+        ledger_rows, days7_start, monitor_rows=mon_all, pool_key="claude_gpt_weekly", clean_rows=base_clean
     )
 
     if ledger_rows:
         agy_usage.annotate_pool_anomalies(ledger_rows)
         overlapping, all_clusters = agy_usage.build_overlap_clusters(ledger_rows)
         gem_ratio, gem_n, gem_cal = agy_usage.estimate_five_h_ratio(
-            ledger_rows, monitor_rows=mon_all, pool="gemini"
+            ledger_rows, monitor_rows=mon_all, pool="gemini", clean_rows=base_clean
         )
         cg_ratio, cg_n, cg_cal = agy_usage.estimate_five_h_ratio(
-            ledger_rows, monitor_rows=mon_all, pool="claude_gpt"
+            ledger_rows, monitor_rows=mon_all, pool="claude_gpt", clean_rows=base_clean
         )
         five_h_to_w = 1.0 / gem_ratio
         weekly_rates, model_samples = agy_usage.calibrate_weekly_model_rates(
-            ledger_rows, overlapping, all_clusters, monitor_rows=mon_all
+            ledger_rows, overlapping, all_clusters, monitor_rows=mon_all, clean_rows=base_clean, gem_ratio=gem_ratio
         )
         today_sum = agy_usage.summarize_period(
             ledger_rows, today_start, weekly_rates, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
@@ -687,10 +774,10 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
         missing_tok = sum(1 for r in ledger_rows if not (r.get("tokens") or {}).get("billedSteps"))
     else:
         gem_ratio, gem_n, gem_cal = agy_usage.estimate_five_h_ratio(
-            [], monitor_rows=mon_all, pool="gemini"
+            [], monitor_rows=mon_all, pool="gemini", clean_rows=base_clean
         )
         cg_ratio, cg_n, cg_cal = agy_usage.estimate_five_h_ratio(
-            [], monitor_rows=mon_all, pool="claude_gpt"
+            [], monitor_rows=mon_all, pool="claude_gpt", clean_rows=base_clean
         )
         five_h_to_w = 1.0 / gem_ratio
         today_sum = {
@@ -743,13 +830,19 @@ def build_dashboard_payload(window="24h", recent_n=25, live=True):
 
     cutoff_ts = win_start_dt.timestamp()
     mon_win = [r for r in mon_all if agy_monitor._row_ts(r) >= cutoff_ts]
-    raw_clean_all = agy_monitor.clean_monitor_timeline(mon_all, five_h_to_weekly=five_h_to_w)
-    clean_all, _corr_meta = agy_usage.apply_local_token_correction(
+    raw_clean_all = (
+        base_clean
+        if abs(five_h_to_w - 0.25) < 1e-4
+        else _clean_monitor_timeline_cached(MONITOR_LOG, mon_all, five_h_to_weekly=five_h_to_w)
+    )
+    clean_all, _corr_meta = _apply_token_corr_cached(
+        mon_stat_key,
+        ledger_stat_key,
         raw_clean_all,
         ledger_rows,
         weekly_rates,
-        five_h_to_weekly=five_h_to_w,
-        rate_preset=rate_preset,
+        five_h_to_w,
+        rate_preset,
     )
     win_summary = agy_monitor.summarize_clean_rows(mon_win, clean_all, since_ts=cutoff_ts)
     all_summary = agy_monitor.summarize_clean_rows(mon_all, clean_all)

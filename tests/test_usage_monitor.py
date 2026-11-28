@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Comprehensive cross-platform unit tests for Antigravity Usage Monitor (v0.2.0)."""
+"""Comprehensive cross-platform unit tests for Antigravity Usage Monitor (v0.2.1)."""
 
 import hashlib
 import importlib
@@ -639,14 +639,14 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertEqual(len(chgs), 1)
         self.assertAlmostEqual(chgs[0]["dgw"], 0.10, places=4)
         self.assertIn("diagnostics", payload)
-        self.assertEqual(payload["diagnostics"]["version"], "0.2.0")
+        self.assertEqual(payload["diagnostics"]["version"], "0.2.1")
 
         # Verify in-memory summary generation writes zero files
         before_files = set(os.listdir(self.data_dir))
         for lang in ("zh-CN", "en"):
             res = self.dashboard_data.perform_action("export_summary", {"lang": lang})
             self.assertTrue(res["ok"])
-            self.assertIn("0.2.0", res["content"])
+            self.assertIn("0.2.1", res["content"])
         self.assertEqual(set(os.listdir(self.data_dir)), before_files)
 
         # Verify bilingual UI markers & zero host CSS regressions
@@ -707,9 +707,9 @@ class AgyUsageMonitorTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(pkg["sha256Path"]))
         with zipfile.ZipFile(pkg["zipPath"], "r") as zf:
             names = set(zf.namelist())
-            self.assertIn("agy-usagemonitor-0.2.0/src/sidecar_daemon.py", names)
-            self.assertIn("agy-usagemonitor-0.2.0/scripts/manage.py", names)
-            self.assertIn("agy-usagemonitor-0.2.0/plugin/plugin.json", names)
+            self.assertIn("agy-usagemonitor-0.2.1/src/sidecar_daemon.py", names)
+            self.assertIn("agy-usagemonitor-0.2.1/scripts/manage.py", names)
+            self.assertIn("agy-usagemonitor-0.2.1/plugin/plugin.json", names)
 
         h = hashlib.sha256()
         with open(pkg["zipPath"], "rb") as f:
@@ -984,6 +984,48 @@ class AgyUsageMonitorTests(unittest.TestCase):
         finally:
             sys.stdout = old_stdout
         self.assertTrue(len(buf.getvalue()) > 0)
+
+    def test_paths_infer_agy_data_root_prefers_app_dir_with_brain(self):
+        app_root = os.path.join(self.tmp.name, "agy_app_root")
+        os.makedirs(os.path.join(app_root, "brain"), exist_ok=True)
+        sidecar_exec_dir = os.path.join(self.tmp.name, "sidecar_data", "usage_monitor_daemon", "data")
+        os.makedirs(sidecar_exec_dir, exist_ok=True)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ANTIGRAVITY_EXECUTABLE_DATA_DIR": sidecar_exec_dir,
+                "ANTIGRAVITY_APP_DATA_DIR": app_root,
+            },
+            clear=False,
+        ):
+            self.assertEqual(self.paths._infer_agy_data_root(), app_root)
+
+        env_no_app = {
+            "ANTIGRAVITY_EXECUTABLE_DATA_DIR": sidecar_exec_dir,
+            "ANTIGRAVITY_APP_DATA_DIR": "",
+        }
+        with mock.patch.dict(os.environ, env_no_app, clear=False):
+            inferred = self.paths._infer_agy_data_root()
+            self.assertNotEqual(inferred, sidecar_exec_dir)
+            self.assertEqual(inferred, os.path.expanduser("~/.gemini/antigravity"))
+
+    def test_dashboard_payload_deduplicates_and_caches_clean_timeline(self):
+        self._seed_sample_logs()
+        self.dashboard_data._clear_caches()
+
+        with mock.patch.object(
+            self.agy_monitor,
+            "clean_monitor_timeline",
+            wraps=self.agy_monitor.clean_monitor_timeline,
+        ) as spy_clean:
+            p1 = self.dashboard_data.build_dashboard_payload(window="24h", recent_n=10, live=False)
+            self.assertEqual(spy_clean.call_count, 1)
+            p2 = self.dashboard_data.build_dashboard_payload(window="24h", recent_n=10, live=False)
+            self.assertEqual(spy_clean.call_count, 1)
+
+        self.assertEqual(p1["reconciliation"], p2["reconciliation"])
+        self.assertEqual(p1["diagnostics"], p2["diagnostics"])
 
 
 if __name__ == "__main__":

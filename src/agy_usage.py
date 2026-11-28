@@ -1160,7 +1160,7 @@ def _robust_median(vals):
     return statistics.median(inliers) if inliers else med
 
 
-def estimate_five_h_ratio(rows, monitor_rows=None, pool="gemini", default_ratio=DEFAULT_FIVE_H_RATIO):
+def estimate_five_h_ratio(rows, monitor_rows=None, pool="gemini", default_ratio=DEFAULT_FIVE_H_RATIO, clean_rows=None):
     """
     Dynamically estimate `Δ5h / ΔWeekly` (e.g. 4.0 on Google AI Ultra) from clean
     non-reset ledger turns and denoised monitor ticks.
@@ -1191,10 +1191,12 @@ def estimate_five_h_ratio(rows, monitor_rows=None, pool="gemini", default_ratio=
             if 0.5 <= ratio <= 20.0:
                 samples.append(ratio)
 
-    if monitor_rows:
+    if clean_rows is None and monitor_rows:
         import agy_monitor
 
         clean_rows = agy_monitor.clean_monitor_timeline(monitor_rows)
+
+    if clean_rows:
         dk5, dkw = ("dc5", "dcw") if is_3p else ("dg5", "dgw")
         rk5, rkw = ("c5", "cw") if is_3p else ("g5", "gw")
         for c in clean_rows:
@@ -1255,7 +1257,9 @@ def _is_quiet_golden_interval(
     return True
 
 
-def calibrate_weekly_model_rates(rows, overlapping_indices, all_clusters, monitor_rows=None):
+def calibrate_weekly_model_rates(
+    rows, overlapping_indices, all_clusters, monitor_rows=None, clean_rows=None, gem_ratio=None
+):
     """
     Calibrate Weekly % per 1M Equivalent Input per model:
       - Uses dynamically inferred 5h:Weekly ratio (`estimate_five_h_ratio`) when 5h pool exists,
@@ -1264,8 +1268,11 @@ def calibrate_weekly_model_rates(rows, overlapping_indices, all_clusters, monito
       - Prefers quiet-window golden samples (`monitor_rows`) + MAD outlier filtering +
         Pass-2 residual solver for clean mixed-model turns.
     """
-    gem_ratio, _, _ = estimate_five_h_ratio(rows, monitor_rows=monitor_rows, pool="gemini")
-    gem_5h_to_w = 1.0 / gem_ratio
+    if gem_ratio is None:
+        gem_ratio, _, _ = estimate_five_h_ratio(
+            rows, monitor_rows=monitor_rows, pool="gemini", clean_rows=clean_rows
+        )
+    gem_5h_to_w = 1.0 / float(gem_ratio)
 
     mon_ok = []
     mon_ts = []
@@ -2119,30 +2126,31 @@ def print_step_details(rows, n_turns):
             )
 
 
-def detect_quota_week_start(rows, fallback_dt, monitor_rows=None, pool_key="gemini_weekly"):
+def detect_quota_week_start(rows, fallback_dt, monitor_rows=None, pool_key="gemini_weekly", clean_rows=None):
     mon_key = "gw" if pool_key == "gemini_weekly" else "cw"
 
-    if monitor_rows:
+    if clean_rows is None and monitor_rows:
         import agy_monitor
 
         clean_rows = agy_monitor.clean_monitor_timeline(monitor_rows)
-        if clean_rows:
-            last_win_reset_idx = -1
-            last_win_reset_dt = None
-            for i, c in enumerate(clean_rows):
-                if (c.get("window_resets") or {}).get(mon_key):
-                    last_win_reset_idx = i
-                    last_win_reset_dt = parse_local_naive(c.get("iso"))
 
-            search_slice = clean_rows[last_win_reset_idx:] if last_win_reset_idx >= 0 else clean_rows
-            for c in reversed(search_slice):
-                res_s = (c.get("resets") or {}).get(mon_key)
-                reset_dt = parse_local_naive(res_s)
-                if reset_dt is not None:
-                    return reset_dt - timedelta(days=7)
+    if clean_rows:
+        last_win_reset_idx = -1
+        last_win_reset_dt = None
+        for i, c in enumerate(clean_rows):
+            if (c.get("window_resets") or {}).get(mon_key):
+                last_win_reset_idx = i
+                last_win_reset_dt = parse_local_naive(c.get("iso"))
 
-            if last_win_reset_dt is not None:
-                return last_win_reset_dt
+        search_slice = clean_rows[last_win_reset_idx:] if last_win_reset_idx >= 0 else clean_rows
+        for c in reversed(search_slice):
+            res_s = (c.get("resets") or {}).get(mon_key)
+            reset_dt = parse_local_naive(res_s)
+            if reset_dt is not None:
+                return reset_dt - timedelta(days=7)
+
+        if last_win_reset_dt is not None:
+            return last_win_reset_dt
 
     best_reset_dt = None
     for r in reversed(rows or []):
@@ -2754,12 +2762,15 @@ def main():
     import agy_monitor
 
     monitor_rows = agy_monitor.load_monitor_rows()
+    base_clean = agy_monitor.clean_monitor_timeline(monitor_rows) if monitor_rows else None
     annotate_pool_anomalies(rows)
     overlapping, all_clusters = build_overlap_clusters(rows)
-    gem_ratio, gem_n, gem_cal = estimate_five_h_ratio(rows, monitor_rows=monitor_rows, pool="gemini")
+    gem_ratio, gem_n, gem_cal = estimate_five_h_ratio(
+        rows, monitor_rows=monitor_rows, pool="gemini", clean_rows=base_clean
+    )
     five_h_to_w = 1.0 / gem_ratio
     weekly_rates, model_samples = calibrate_weekly_model_rates(
-        rows, overlapping, all_clusters, monitor_rows=monitor_rows
+        rows, overlapping, all_clusters, monitor_rows=monitor_rows, clean_rows=base_clean, gem_ratio=gem_ratio
     )
 
     if not args.live:
@@ -2768,8 +2779,12 @@ def main():
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     days7_start = now - timedelta(days=7)
-    quota_wk_start = detect_quota_week_start(rows, days7_start, monitor_rows=monitor_rows, pool_key="gemini_weekly")
-    cg_wk_start = detect_quota_week_start(rows, days7_start, monitor_rows=monitor_rows, pool_key="claude_gpt_weekly")
+    quota_wk_start = detect_quota_week_start(
+        rows, days7_start, monitor_rows=monitor_rows, pool_key="gemini_weekly", clean_rows=base_clean
+    )
+    cg_wk_start = detect_quota_week_start(
+        rows, days7_start, monitor_rows=monitor_rows, pool_key="claude_gpt_weekly", clean_rows=base_clean
+    )
 
     periods = [
         ("今日 (Today)", today_start),
@@ -2825,16 +2840,41 @@ def main():
         print("* 注：" + "；".join(notes) + "。")
 
     if monitor_rows:
+        raw_clean = (
+            base_clean
+            if (base_clean is not None and abs(five_h_to_w - 0.25) < 1e-4)
+            else agy_monitor.clean_monitor_timeline(monitor_rows, five_h_to_weekly=five_h_to_w)
+        )
+        corrected_all, _ = apply_local_token_correction(
+            raw_clean, rows, weekly_rates, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+        )
+        mon_sum_gem = agy_monitor.summarize_clean_rows(
+            monitor_rows, corrected_all, since_ts=quota_wk_start.timestamp()
+        )
         rec_gem = reconcile_shared_pools(
-            rows, monitor_rows, weekly_rates, quota_wk_start, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+            rows,
+            monitor_rows,
+            weekly_rates,
+            quota_wk_start,
+            mon_summary=mon_sum_gem,
+            five_h_to_weekly=five_h_to_w,
+            rate_preset=rate_preset,
         )
-        rec_cg = (
-            rec_gem
-            if cg_wk_start == quota_wk_start
-            else reconcile_shared_pools(
-                rows, monitor_rows, weekly_rates, cg_wk_start, five_h_to_weekly=five_h_to_w, rate_preset=rate_preset
+        if cg_wk_start == quota_wk_start:
+            rec_cg = rec_gem
+        else:
+            mon_sum_cg = agy_monitor.summarize_clean_rows(
+                monitor_rows, corrected_all, since_ts=cg_wk_start.timestamp()
             )
-        )
+            rec_cg = reconcile_shared_pools(
+                rows,
+                monitor_rows,
+                weekly_rates,
+                cg_wk_start,
+                mon_summary=mon_sum_cg,
+                five_h_to_weekly=five_h_to_w,
+                rate_preset=rate_preset,
+            )
         print_shared_pool_reconciliation(rec_gem, rec_cg)
 
     print_model_table(rows, weekly_rates, model_samples, rate_preset=rate_preset)

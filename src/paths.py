@@ -41,9 +41,21 @@ MONITOR_LOG = os.path.join(DATA_DIR, "monitor.jsonl")
 SIDECAR_STATE_PATH = os.path.join(DATA_DIR, "sidecar_runtime.json")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
-AGY_DATA_ROOT = os.path.expanduser(
-    os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "~/.gemini/antigravity"
-)
+def _infer_agy_data_root():
+    for env_key in ("ANTIGRAVITY_APP_DATA_DIR", "ANTIGRAVITY_EXECUTABLE_DATA_DIR"):
+        val = (os.environ.get(env_key) or "").strip()
+        if not val:
+            continue
+        cand = os.path.expanduser(val)
+        if os.path.isdir(os.path.join(cand, "brain")):
+            return cand
+    app_dir = (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+    if app_dir:
+        return os.path.expanduser(app_dir)
+    return os.path.expanduser("~/.gemini/antigravity")
+
+
+AGY_DATA_ROOT = _infer_agy_data_root()
 BRAIN_DIR = os.path.expanduser(
     os.environ.get("AGY_BRAIN_DIR") or os.path.join(AGY_DATA_ROOT, "brain")
 )

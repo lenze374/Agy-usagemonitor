@@ -2144,7 +2144,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const cR = diag.cgRatio || { ratio: 4.0, samples: 0, calibrated: false };
       const poolsTxt = (diag.poolKeys && diag.poolKeys.length) ? diag.poolKeys.join(', ') : '-';
       const rows = [
-        [t.diagVer, `v${diag.version || '0.2.0'}`],
+        [t.diagVer, `v${diag.version || '0.2.1'}`],
         [t.diagBill, `${diag.billingMode || '-'}${diag.plan ? ' (' + diag.plan + ')' : ''}`],
         [t.diagPreset, t.diagPresetVal(activePreset)],
         [t.diagRatioGem, t.diagCal(Number(gR.ratio || 4).toFixed(2), gR.samples || 0, gR.calibrated)],
